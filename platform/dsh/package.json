@@ -1,0 +1,99 @@
+{
+  "name": "dsh-notifier-gate",
+  "version": "0.13.1-qq.2",
+  "description": "DSH QQ 官方机器人通知插件（dsh-notifier 的 QQ 专项裁剪版）：仅保留 qq-bot 出站渠道与 QQ 入站网关，修复运行时配置被深冻结导致的投递崩溃，可复用原 dsh-notifier 的配置与状态。",
+  "type": "module",
+  "main": "src/plugin-entry.mjs",
+  "exports": {
+    ".": "./src/plugin-entry.mjs",
+    "./internal": "./src/index.mjs",
+    "./package.json": "./package.json",
+    "./client": "./client.js"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "client.js",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.1.7 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "notify",
+    "notification",
+    "qq",
+    "qq-bot",
+    "push-notifications"
+  ],
+  "dshWorkshop": {
+    "schema": "omdsh-workshop-package/v1",
+    "type": "plugin",
+    "integration": {
+      "protocol": "harness-cordis",
+      "artifact": "cordis.patch.yml"
+    },
+    "install": {
+      "mode": "guided",
+      "adapter": "third-party",
+      "failurePolicy": "manual",
+      "touchesCurrentBeforeActivation": false
+    },
+    "lifecycle": {
+      "activation": "immediate",
+      "dispose": "supported"
+    },
+    "permissions": [
+      "harness:tool",
+      "harness:event",
+      "network:outbound",
+      "network:listen",
+      "file:read",
+      "file:write",
+      "subprocess:exec",
+      "shell:none",
+      "credentials:write"
+    ],
+    "compatibility": {
+      "dshVersions": [
+        "0.1.7-rc.2",
+        "0.2.1-rc.2"
+      ]
+    },
+    "capability": {
+      "id": "notify-qq",
+      "kind": "tool",
+      "invocation": "invoke the model-facing notify tool with a message through the DSH ToolRuntime, or let the event listener push on turn completion",
+      "expected": "the notifier delivers to the configured QQ bot channel and returns a structured result; an unconfigured channel returns a structured skipped/failed result without blocking the turn",
+      "evidence": null
+    },
+    "evidence": {
+      "install": null,
+      "failureIsolation": null,
+      "hotReload": null,
+      "remove": null
+    }
+  }
+}

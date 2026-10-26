@@ -1,0 +1,375 @@
+// dsh-notifier config.mjs
+// channels[] 配置解析 + 密钥脱敏。
+// 设计要点：
+//  - 配置来源：profile cordis.patch.yml 中 dsh-notifier 行的 config（cordis 原样传入 apply）。
+//  - 每个渠道一行 { type, enabled?, ...字段 }，未配置渠道静默跳过（加载期仅 warn，绝不弄崩启动，学 dsh-email）。
+//  - 密钥字段不落日志：SECRET_FIELDS 声明每渠道的 secret 键，诊断日志只回「已配置」事实与末 4 位。
+
+import { NotifyError, ERROR_CODES } from './adapters/_shared.mjs'
+import { isPublicExposure } from './security/exposure.mjs'
+// dsh-notifier-qq：QQ 专项裁剪版，出站只保留官方机器人渠道。
+// 其余渠道（telegram/钉钉/飞书/wxpusher/…/spec 声明表）在本副本中整体移除：
+// CHANNEL_TYPES 是管理台、控制面、路由与出站装配的唯一渠道全集来源，收缩此处即全局收缩。
+import * as qqBot from './adapters/qq-bot.mjs'
+
+/** adapter 注册表：type -> { type, resolve, send }。本副本仅注册 qq-bot。 */
+export const ADAPTERS = Object.freeze({
+  'qq-bot': qqBot,
+})
+
+export const CHANNEL_TYPES = Object.freeze(Object.keys(ADAPTERS))
+
+/**
+ * 远程日志（Commit20 /log）hard caps：用户不可放大的**硬上限**。
+ * 敏感诊断能力（ledger 标题可能含任务上下文），故 remoteLog 配置再怎么写也只在此范围内生效。
+ */
+export const REMOTE_LOG_HARD_MAX_LINES = 200
+export const REMOTE_LOG_HARD_MAX_BYTES = 8192
+/** /log 缺省回传条数（无参时）。 */
+export const REMOTE_LOG_DEFAULT_LINES = 20
+
+/** 每渠道的 secret 键：这些字段在日志/诊断里必须脱敏。 */
+const SECRET_FIELDS = {
+  'qq-bot': ['appId', 'appSecret'],
+}
+
+/** 取某渠道的 secret 键列表（未知渠道返回空数组）。 */
+export function secretFieldsOf(type) {
+  return SECRET_FIELDS[type] ?? []
+}
+
+/**
+ * 手写 adapter 的字段表（管理台凭证表单渲染用，v0.3.3）：
+ * 形状对齐 spec 引擎的 fields 声明（{ [key]: { required?, secret?, desc } }）。
+ * spec 渠道不在此表——由 ADAPTERS[type].spec.fields 机器读取（单一事实源）。
+ */
+const FIELD_HINTS = {
+  'qq-bot': {
+    appId: { required: true, secret: true, desc: 'QQ 开放平台开发者 ID（q.qq.com → 机器人开发设置）' },
+    appSecret: { required: true, secret: true, desc: '同页面 AppSecret' },
+    targetType: { required: false, secret: false, desc: '"user"（单聊，默认）或 "group"（群聊）' },
+    userId: { required: false, secret: false, desc: '单聊目标用户 openid（targetType=user 时）' },
+    groupId: { required: false, secret: false, desc: '群 open id（targetType=group 时）' },
+    markdown: { required: false, secret: false, desc: '默认 markdown（msg_type=2）；填 false 回退纯文本（msg_type=0）' },
+  },
+}
+
+/**
+ * 取某渠道的凭证字段表（管理台表单渲染用，v0.3.3）：spec 渠道读声明表（含 desc/required/
+ * secret，单一事实源），手写渠道读 FIELD_HINTS。返回 { [key]: { required?, secret?, desc } }
+ * 的浅拷贝；未知渠道返回 {}（防御，绝不抛）。
+ */
+export function channelFieldsOf(type) {
+  const spec = ADAPTERS[type]?.spec
+  const fields = (spec !== null && typeof spec === 'object' && spec.fields !== null && typeof spec.fields === 'object')
+    ? spec.fields
+    : FIELD_HINTS[type]
+  if (fields === null || typeof fields !== 'object') return {}
+  return { ...fields }
+}
+
+/**
+ * 渠道是否声明 fixedOptions（官方固定端点，不暴露 timeoutMs/apiBase 等
+ * 引擎级调优键——管理台键白名单据此收窄）。未知渠道返回 false。
+ */
+export function channelFixedOptions(type) {
+  return ADAPTERS[type]?.spec?.fixedOptions === true
+}
+
+/**
+ * 渠道官方接入文档地址（spec 声明 docUrl 时返回，管理台卡片渲染跳转链接）。
+ * 非法/未声明返回 undefined（行内省略该键）。
+ */
+export function channelDocUrlOf(type) {
+  const url = ADAPTERS[type]?.spec?.docUrl
+  return typeof url === 'string' && url !== '' ? url : undefined
+}
+
+/**
+ * 解析 ${ENV:NAME} 式环境变量引用（全值替换）。
+ * 「通知器是密钥集中器」：让密钥可以不落 profile 明文；缺失环境变量返回空串
+ * （渠道会因校验失败被跳过，reason 里带字段名与来源指引）。
+ */
+const ENV_REF = /^\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}$/
+
+export function resolveEnvRef(value) {
+  if (typeof value !== 'string') return value
+  const match = ENV_REF.exec(value.trim())
+  if (match === null) return value
+  return process.env[match[1]] ?? ''
+}
+
+/** 递归把配置对象里的 ${ENV:NAME} 字符串值替换为环境变量值。 */
+export function resolveEnvRefs(value) {
+  if (typeof value === 'string') return resolveEnvRef(value)
+  if (Array.isArray(value)) return value.map(resolveEnvRefs)
+  if (value !== null && typeof value === 'object') {
+    const out = {}
+    for (const [key, item] of Object.entries(value)) out[key] = resolveEnvRefs(item)
+    return out
+  }
+  return value
+}
+
+/** 归一化一条通知消息：确保 title/content 为字符串，补齐 level/group。 */
+export function normalizeMessage(msg = {}) {
+  const raw = msg ?? {}
+  const title = typeof raw.title === 'string' ? raw.title.trim() : ''
+  const content = typeof raw.content === 'string' ? raw.content.trim() : ''
+  const level = typeof raw.level === 'string' ? raw.level : undefined
+  const group = typeof raw.group === 'string' ? raw.group : undefined
+  return { title, content, level, group }
+}
+
+/** 递归脱敏单个值：字符串只留末 4 位，对象/数组递归处理。 */
+function maskValue(value) {
+  if (typeof value === 'string') return value.length > 0 ? `••••••••${value.slice(-4)}` : value
+  if (Array.isArray(value)) return value.map(maskValue)
+  if (value !== null && typeof value === 'object') {
+    const out = {}
+    for (const [key, item] of Object.entries(value)) out[key] = maskValue(item)
+    return out
+  }
+  return value
+}
+
+/** 把某渠道配置脱敏成可安全打印的摘要（只回「是否配置」+ 末 4 位）。 */
+export function maskChannelConfig(type, cfg) {
+  const secrets = new Set(secretFieldsOf(type))
+  const fields = channelFieldsOf(type)
+  const masked = {}
+  for (const [key, value] of Object.entries(cfg ?? {})) {
+    const knownPublic = Object.prototype.hasOwnProperty.call(fields, key) && isPublicExposure(fields[key])
+    masked[key] = !knownPublic || secrets.has(key) ? maskValue(value) : value
+  }
+  return masked
+}
+
+/**
+ * 解析并归一化 channels[] 配置。
+ * 返回 { enabled, debounceMs, summaryMaxChars, titlePrefix, lang, channels }：
+ *   channels = [{ type, config }] 已 resolve 的可发送渠道；
+ *   skipped   = [{ type, reason }] 未配置/禁用/未知类型的渠道（调用方负责 warn）。
+ * 绝不 throw：任何单渠道问题都只是跳过，不弄崩启动。
+ */
+export function resolveConfig(config = {}) {
+  const raw = config ?? {}
+  const enabled = raw.enabled !== false
+  const debounceMs = typeof raw.debounceMs === 'number' && Number.isFinite(raw.debounceMs)
+    ? Math.max(0, Math.trunc(raw.debounceMs))
+    : 10000
+  const summaryMaxChars = typeof raw.summaryMaxChars === 'number' && Number.isFinite(raw.summaryMaxChars)
+    ? Math.max(0, Math.trunc(raw.summaryMaxChars))
+    : 500
+  const titlePrefix = typeof raw.titlePrefix === 'string' ? raw.titlePrefix.trim() : ''
+  // S-05（CWE-200）出站脱敏档位：minimal（默认）= 摘录 80 字符 + 密钥形态打码；
+  // extended = 维持原文（用户显式选择向第三方 IM 外发完整片段，README 已声明数据流向）。
+  // 非法值一律回落 minimal：安全配置的非法值不配得到宽松解释。
+  const redaction = raw.redaction === 'extended' ? 'extended' : 'minimal'
+  // 自动推送文案语言：'zh'（默认）| 'en'。未知值回落 zh，归一化与 redaction 同法。
+  const lang = raw.lang === 'en' ? 'en' : 'zh'
+
+  // 事件粒度开关（阶段 2 规则引擎）：默认全开。turnEnd 支持两种写法：
+  //   turnEnd: false                     → 整类关闭
+  //   turnEnd: { completed: false, ... } → 按结束原因分控（未知原因键默认放行，不吞新事件）
+  const rawEvents = (raw.events !== null && typeof raw.events === 'object') ? raw.events : {}
+  const rawTurnEnd = rawEvents.turnEnd
+  const turnEndKinds = (kindMap) => {
+    const defaults = { completed: true, error: true, blocked: true, aborted: true, 'max-tokens': true, interrupted: true }
+    if (kindMap === null || typeof kindMap !== 'object' || Array.isArray(kindMap)) return defaults
+    const out = { ...defaults }
+    for (const [kind, enabled] of Object.entries(kindMap)) {
+      if (typeof enabled === 'boolean') out[kind] = enabled
+    }
+    return out
+  }
+  const events = {
+    turnEnd: {
+      enabled: rawTurnEnd !== false,
+      kinds: turnEndKinds(rawTurnEnd),
+    },
+    approval: rawEvents.approval !== false,
+    agentError: rawEvents.agentError !== false,
+    // ---- v0.5 状态上报三键（移动指挥中心）----
+    // turnStart 默认关：桌面场景每 turn 一条「任务开始」是噪音；移动场景（发完任务
+    // 即离开）建议显式开启。longRunning/stall 默认开：低噪高值（15min+ 长任务心跳 /
+    // 10min 无事件疑似卡住），存量「零配置」用户的长任务从此有信号——版本主题，非回归。
+    // 数值军规（v0.3.2 mergeWindowMs 教训）：Math.max(60_000, Number(x) || 默认)——
+    // 下限钳制 60s 杜绝误配刷屏；0 不是合法值（关闭一律 enabled: false），无 0 歧义。
+    turnStart: {
+      enabled: rawEvents.turnStart === true
+        || (rawEvents.turnStart !== null && typeof rawEvents.turnStart === 'object' && rawEvents.turnStart.enabled === true),
+    },
+    longRunning: (() => {
+      const raw = (rawEvents.longRunning !== null && typeof rawEvents.longRunning === 'object') ? rawEvents.longRunning : {}
+      const enabled = rawEvents.longRunning !== false && raw.enabled !== false
+      const firstAfterMs = Math.max(60_000, Number(raw.firstAfterMs) || 900_000)
+      return { enabled, firstAfterMs, everyMs: Math.max(60_000, Number(raw.everyMs) || firstAfterMs) }
+    })(),
+    stall: (() => {
+      const raw = (rawEvents.stall !== null && typeof rawEvents.stall === 'object') ? rawEvents.stall : {}
+      return {
+        enabled: rawEvents.stall !== false && raw.enabled !== false,
+        afterMs: Math.max(60_000, Number(raw.afterMs) || 600_000),
+      }
+    })(),
+  }
+
+  // agent 工具滑动窗口调用上限（阶段 6）：防 prompt injection 把用户渠道刷成垃圾出口；0 = 不限。
+  const toolRateLimitPerMinute = typeof raw.toolRateLimitPerMinute === 'number' && Number.isFinite(raw.toolRateLimitPerMinute)
+    ? Math.max(0, Math.trunc(raw.toolRateLimitPerMinute))
+    : 10
+
+  // v0.8 远程提问（ask_user 工具）：默认启用；超时默认 5 分钟（30s-30min 钳制在
+  // questions/router 的 validateAskArgs），限流默认 6 次/分钟（提问比通知更稀缺）。
+  const rawQuestions = (raw.questions !== null && typeof raw.questions === 'object') ? raw.questions : {}
+  // v0.10 Web-first 远程升级（任务书 3.3/8）：Stage 0（pending，Web 立即可见）→ Stage 1
+  // 推主绑定 IM 的延迟默认 20s；Stage 2 备用目标提醒默认 60s（从 t=0）。显式 0 关闭 Web-first
+  // （立即推送）。remoteEnabled=false 只保留 Web 可见、永不推 IM（关闭远程推送不破坏原生 Web 提问）。
+  const questionsWebFirstRaw = Number(rawQuestions.webFirstMs)
+  const questionsReminderRaw = Number(rawQuestions.reminderMs)
+  const questions = {
+    enabled: rawQuestions.enabled !== false,
+    timeoutMs: typeof rawQuestions.timeoutMs === 'number' && Number.isFinite(rawQuestions.timeoutMs) && rawQuestions.timeoutMs > 0
+      ? Math.trunc(rawQuestions.timeoutMs)
+      : 300_000,
+    rateLimitPerMinute: typeof rawQuestions.rateLimitPerMinute === 'number' && Number.isFinite(rawQuestions.rateLimitPerMinute)
+      ? Math.max(0, Math.trunc(rawQuestions.rateLimitPerMinute))
+      : 6,
+    webFirstMs: Number.isFinite(questionsWebFirstRaw) ? Math.max(0, Math.trunc(questionsWebFirstRaw)) : 20_000,
+    reminderMs: Number.isFinite(questionsReminderRaw) ? Math.max(0, Math.trunc(questionsReminderRaw)) : 60_000,
+    remoteEnabled: rawQuestions.remoteEnabled !== false,
+  }
+
+  // 远程日志（Commit20 /log）：敏感诊断能力，**默认关**（enabled 仅显式 true 才开）。
+  // maxLines/maxBytes 一律 clamp 到 hard caps（§11.5：用户不能放大），非有限数字回落上限：
+  // 安全配置的非法值不配得到宽松解释（与 graceSeconds 同法，只认真正的 number）。
+  // owner-only 与脱敏在 conversation 层执行。
+  const rawRemoteLog = (raw.remoteLog !== null && typeof raw.remoteLog === 'object' && !Array.isArray(raw.remoteLog)) ? raw.remoteLog : {}
+  const remoteLog = {
+    enabled: rawRemoteLog.enabled === true,
+    maxLines: typeof rawRemoteLog.maxLines === 'number' && Number.isFinite(rawRemoteLog.maxLines)
+      ? Math.min(REMOTE_LOG_HARD_MAX_LINES, Math.max(1, Math.trunc(rawRemoteLog.maxLines)))
+      : REMOTE_LOG_HARD_MAX_LINES,
+    maxBytes: typeof rawRemoteLog.maxBytes === 'number' && Number.isFinite(rawRemoteLog.maxBytes)
+      ? Math.min(REMOTE_LOG_HARD_MAX_BYTES, Math.max(256, Math.trunc(rawRemoteLog.maxBytes)))
+      : REMOTE_LOG_HARD_MAX_BYTES,
+  }
+
+  // 空闲宽限窗（阶段 2 规则引擎）：turn 结束后等 N 秒，期间用户在页面/终端输入即取消打扰。
+  const graceSeconds = typeof raw.graceSeconds === 'number' && Number.isFinite(raw.graceSeconds)
+    ? Math.max(0, Math.trunc(raw.graceSeconds))
+    : 0
+
+  // 出站收敛分段（阶段 5）：超预算长文本按 Unicode 码点切段（含（i/n）前缀）顺序送达。
+  const rawSegment = (raw.segment !== null && typeof raw.segment === 'object') ? raw.segment : {}
+  const segment = {
+    enabled: rawSegment.enabled !== false,
+    maxCodepoints: typeof rawSegment.maxCodepoints === 'number' && Number.isFinite(rawSegment.maxCodepoints)
+      ? Math.max(60, Math.trunc(rawSegment.maxCodepoints))
+      : 1200,
+  }
+
+  const channels = []
+  const skipped = []
+  const rawChannels = Array.isArray(raw.channels) ? raw.channels : []
+
+  for (const row of rawChannels) {
+    if (row === null || typeof row !== 'object') {
+      skipped.push({ type: '(未知)', reason: '渠道行不是对象' })
+      continue
+    }
+    if (row.enabled === false) {
+      skipped.push({ type: String(row.type ?? '(未知)'), reason: 'disabled' })
+      continue
+    }
+    const type = typeof row.type === 'string' ? row.type.trim() : ''
+    const adapter = ADAPTERS[type]
+    if (adapter === undefined) {
+      skipped.push({ type: type || '(空)', reason: `未知渠道类型（可用：${CHANNEL_TYPES.join('/')}）` })
+      continue
+    }
+    try {
+      // 密钥环境变量引用（${ENV:NAME}）先于校验解析，密钥可不落 profile 明文
+      const resolved = adapter.resolve(resolveEnvRefs(row))
+      channels.push({ type, config: resolved })
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      skipped.push({ type, reason })
+    }
+  }
+
+  // Web 管理台（v0.3.3）：默认关闭（opt-in）。host 不可配——红线：永远只绑 127.0.0.1，
+  // 公网暴露管理台 = 暴露全部凭证写权限，需要公网由用户自行反代（设计稿 §0.5-6）。
+  // token 缺省由 index.mjs 自动生成并打印（state 只存哈希）；显式提供则以其为准。
+  const rawAdmin = (raw.admin !== null && typeof raw.admin === 'object' && !Array.isArray(raw.admin)) ? raw.admin : {}
+  const adminPort = typeof rawAdmin.port === 'number' && Number.isFinite(rawAdmin.port)
+    ? Math.min(65535, Math.max(1, Math.trunc(rawAdmin.port)))
+    : 8104
+  const admin = {
+    enabled: rawAdmin.enabled === true,
+    port: adminPort,
+    token: typeof rawAdmin.token === 'string' && rawAdmin.token.trim() !== '' ? rawAdmin.token : '',
+  }
+
+  // 公共面（v0.6，设计稿 §2）：其他插件经 ctx.notifier 服务注入推送 + 订阅 sent 事件。
+  // enabled 默认开——服务注入是消费插件的硬依赖（spike 验证：缺服务宿主直接拒绝启动），
+  // 关闭时 index 仍注入 no-op stub（push 返回 skipped），消费方永不崩。
+  // emit:false = 不发射 dsh-notifier/sent（保留「关闭零开销」家训）；限流 0 = 不限。
+  const rawPublic = (raw.public !== null && typeof raw.public === 'object' && !Array.isArray(raw.public)) ? raw.public : {}
+  const publicLimit = Number(rawPublic.limitPerMinutePerSource)
+  const publicBlock = {
+    enabled: rawPublic.enabled !== false,
+    limitPerMinutePerSource: Number.isFinite(publicLimit) && publicLimit >= 0 ? Math.trunc(publicLimit) : 10,
+    emit: rawPublic.emit !== false,
+  }
+  // Optional facade-instance budgets.  Omit absent keys to preserve the
+  // historical resolved shape; createPublicFacade supplies finite defaults.
+  for (const [key, fallback] of [
+    ['maxCalls', 10_000],
+    ['maxBytes', 10 * 1024 * 1024],
+    ['maxConcurrent', 16],
+    ['maxQueue', 64],
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(rawPublic, key)) continue
+    const value = Number(rawPublic[key])
+    publicBlock[key] = Number.isFinite(value) && value >= 0
+      ? Math.trunc(value)
+      : fallback
+  }
+  return {
+    enabled,
+    debounceMs,
+    summaryMaxChars,
+    titlePrefix,
+    redaction,
+    lang,
+    events,
+    toolRateLimitPerMinute,
+    questions,
+    remoteLog,
+    graceSeconds,
+    routing: (raw.routing !== null && typeof raw.routing === 'object') ? raw.routing : {},
+    // v0.6.1：inbound 块对齐 channels 的 ${ENV:NAME} 密钥引用语义（真机事故 §7：
+    // 出站解析、入站不解析的双路径不一致——botToken 写 ${ENV:...} 在 inbound 是字面量，
+    // 401 退避且不可见）。resolveEnvRefs 递归替换字符串值，非字符串原样保留。
+    inbound: resolveEnvRefs((raw.inbound !== null && typeof raw.inbound === 'object') ? raw.inbound : {}),
+    approval: (raw.approval !== null && typeof raw.approval === 'object') ? raw.approval : {},
+    segment,
+    digest: (raw.digest !== null && typeof raw.digest === 'object') ? raw.digest : {},
+    keywords: (raw.keywords !== null && typeof raw.keywords === 'object') ? raw.keywords : {},
+    admin,
+    public: publicBlock,
+    channels,
+    skipped,
+  }
+}
+
+/** 单渠道发送结果（供 notify()/notifyAll() 与工具渲染）。 */
+export function channelResult(channel, outcome, error) {
+  if (outcome === 'sent') return { channel, ok: true, skipped: false, error: undefined }
+  if (outcome === 'skipped') return { channel, ok: false, skipped: true, error: undefined }
+  return { channel, ok: false, skipped: false, error }
+}
+
+export { NotifyError, ERROR_CODES }

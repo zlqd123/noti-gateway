@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "enabled": true,
+    "events": {
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "<bash.exe 绝对路径，如 D:/net/Git/bin/bash.exe —— 钩子运行器不解析裸命令>",
+              "args": ["<本脚本部署路径>/qq-notify.sh"],
+              "timeoutMs": 20000,
+              "statusMessage": "发送 QQ 通知"
+            }
+          ]
+        }
+      ],
+      "PermissionRequest": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "<同上 bash.exe 绝对路径>",
+              "args": ["<同上>/qq-notify.sh", "ask"],
+              "timeoutMs": 110000,
+              "statusMessage": "等待 QQ 按钮确认"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

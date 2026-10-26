@@ -1,0 +1,720 @@
+// dsh-notifier approval/router.mjs
+// approval/request 瀑布流处理器（远程审批，阶段 4 核心）。
+// 宿主事实（已核对 user-approval 源码）：ApprovalRequest = { agent, toolName, callId?, reason?, signal? }
+// ——没有 id 字段，审批 id 由 service 内部签发。因此本模块自行铸 key：
+//   key = ap:<callId ?? toolName>:<单调计数>，并把 agent/session 一起入账。
+// 安全红线：
+//  - 静默永不批准：超时/无响应/解析失败/异常一律 return next() 交还桌面
+//  - 一次点击只授权一次操作：token 单次核销 + 账本状态机（首达采纳）
+//  - A listener never throws：整个 handler 包 try/catch，任何异常退回 next()
+//  - observe 模式只旁观：推完卡片立即 next()，桌面照常决定
+
+import { createEscalationChain } from './escalation.mjs'
+import { stringsOf } from '../strings.mjs'
+import { normalizeInbound, parseApprovalAction } from '../inbound/_contract.mjs'
+import { MESSAGE_PRIORITY } from '../inbound/bus.mjs'
+import { guardTargets } from '../inbound/target-guard.mjs'
+import { createInteractionLedger } from '../interaction/ledger.mjs'
+import { workspaceOf } from '../routing/session-registry.mjs'
+// 维护批 6 前置：跨渠道能力矩阵作为单一事实来源
+import { displayNameOf, toInboundChannelName } from '../inbound/capability-matrix.mjs'
+// S-05：审批推送 reason 脱敏（minimal 默认）
+import { maskSecrets, normalizeRedaction } from '../redact.mjs'
+import { setDurable } from '../inbound/store.mjs'
+
+const OUTCOME_ALLOWED = 'allowed-once'
+const OUTCOME_REJECTED = 'rejected'
+// 升级链默认节奏：30s / 60s 各再提醒一轮（timeoutMs 默认 120s 内完成两轮升级）。
+// note 不在此处定死——默认节奏的提醒文案随 lang 在装配点注入（t.approval.escStageNote1/2）。
+const DEFAULT_ESCALATION_STAGES = [
+  { afterMs: 30_000, level: 'timeSensitive' },
+  { afterMs: 60_000, level: 'timeSensitive' },
+]
+
+// G-34（D5）：卡片/编号裁决成功后，同 key 文本线（广播、升级链）5min 抑制窗口——
+// 双路径（事件线文本 + 交互线卡片）通知双响封口：用户点过卡片后不再收到"仍在等待批准"。
+const TEXT_SUPPRESS_WINDOW_MS = 5 * 60 * 1000
+
+// G-16（D4）：重启残留审批的失效告知文案（补发给 pushedTo 目标）——文案取自 strings 表。
+
+// strings 未接线时的 zh 兜底（单一事实源 = stringsOf()；wiring 统一传 stringsOf(lang)）。
+const ZH_FALLBACK = stringsOf()
+
+/**
+ * 注册 approval/request 处理器。
+ * @param {object} deps
+ * @param {object} deps.ctx - cordis 上下文（ctx.on）
+ * @param {object} deps.notifier - createNotifier 实例（升级链推送用）
+ * @param {ReturnType<typeof import('../inbound/bus.mjs').createInboundBus>} deps.bus
+ * @param {ReturnType<typeof import('../inbound/tokens.mjs').createTokenVault>} deps.vault
+ * @param {import('../inbound/store.mjs').store} deps.store - pending 账本持久化
+ * @param {object} deps.telegram - （旧入口，v0.2.0 兼容）createTelegramInbound 实例；可为 null
+ * @param {object[]} [deps.interactive] - 交互渠道实例列表（v0.3.0 多通道入口；提供时优先于 deps.telegram）。
+ *   每项实现统一契约（channel/notifyTargets/sendApprovalCard/editResolved/sendText，
+ *   见 inbound/_contract.mjs）；telegram 旧形状（notifyChatIds/editResolved(chatId,messageId,text)）也接受
+ * @param {{ mode?: 'observe'|'answer', timeoutMs?: number, numberedReply?: boolean,
+ *           escalation?: { enabled?: boolean, stages?: Array<object> } }} [deps.approvalConfig]
+ * @param {object} [deps.logger]
+ * @param {number} [deps.counterStart=随机] - 审批 key 计数器起点。生产随机化（v0.6.4：
+ *   重启后 counter 归零 + 同 callId 复现会让旧卡片 token 撞新审批的 key，在 tokenSecret
+ *   持久化 + 10min TTL 内可被旧卡误裁决——随机起点把撞 key 概率压到 1e-6 级）；测试传 0
+ *   保住 `ap:<callId>:<n>` 的确定性断言。
+ * @param {ReturnType<typeof import('../routing/agent-router.mjs').createAgentRouter>} [deps.router]
+ *   - v0.3.2 审批分流：request.agent 可解析时，审批只发该 agent 绑定的通道（替代全局广播）。
+ *     审批不受 quiet 影响——静音审批 = 审批永远超时回落桌面，违背「沉默永不批准」的可预期性。
+ * @returns {() => void} 反注册函数
+ * @param {object} [strings] - 文案表（wiring 传 stringsOf(lang)；缺省 zh 兜底）
+ */
+export function registerApprovalHandler(deps, strings) {
+  const { ctx, notifier, bus, vault, store, identity } = deps
+  const t = strings ?? ZH_FALLBACK
+  // 通道名 → 用户可读名（广播文案用；随 lang 解析：strings.commands.channelNames
+  // 已按 lang 取词，缺失渠道回落 capability-matrix 的 displayNameOf）。
+  const DISPLAY_NAMES = {
+    get telegram() { return t.commands?.channelNames?.telegram ?? displayNameOf('telegram') },
+    get feishu() { return t.commands?.channelNames?.feishu ?? displayNameOf('feishu') },
+    get qq() { return t.commands?.channelNames?.qq ?? displayNameOf('qq') },
+    get wxpusher() { return t.commands?.channelNames?.wxpusher ?? displayNameOf('wxpusher') },
+    get wechat() { return t.commands?.channelNames?.wechat ?? displayNameOf('wechat') },
+    get dingtalk() { return t.commands?.channelNames?.dingtalk ?? displayNameOf('dingtalk') },
+  }
+  const router = deps.router ?? null
+  const approvalConfig = deps.approvalConfig ?? {}
+  const mode = approvalConfig.mode === 'answer' ? 'answer' : 'observe'
+  const timeoutMs = Math.max(1000, Number(approvalConfig.timeoutMs) || 120000)
+  // S-05（CWE-200）：审批推送到第三方 IM 的 reason 是 agent 生成文本，minimal（默认）
+  // 下对密钥形态打码——不影响裁决所需信息（看到 sk-*** 足以判断，无需真实密钥值）。
+  const redaction = normalizeRedaction(deps.redaction)
+  const warn = (message) => {
+    try { deps.logger?.warn?.('[dsh-notifier-qq/approval]', message) } catch { /* 日志失败绝不致命 */ }
+  }
+
+  // 升级链：主推送无人响应时按 stages 节奏再提醒（answer 模式下与 wait 并行）
+  const escalationCfg = (approvalConfig.escalation !== null && typeof approvalConfig.escalation === 'object')
+    ? approvalConfig.escalation
+    : {}
+  const escalationStages = Array.isArray(escalationCfg.stages) && escalationCfg.stages.length > 0
+    ? escalationCfg.stages
+    // 默认节奏的提醒文案随 lang 在此处注入（自定义 stages 的 note 仍完全由用户控制）
+    : DEFAULT_ESCALATION_STAGES.map((stage, index) => ({
+      ...stage,
+      note: index === 0 ? t.approval.escStageNote1 : t.approval.escStageNote2,
+    }))
+  const escalation = createEscalationChain({
+    stages: escalationCfg.enabled === false ? [] : escalationStages,
+    logger: deps.logger,
+  })
+
+  let counter = Number.isFinite(deps.counterStart) ? deps.counterStart : Math.floor(Math.random() * 1_000_000)
+  // 交互渠道列表（统一契约）：deps.interactive 优先；未提供时回退 v0.2.0 的单 telegram 入口
+  const rawInteractive = Array.isArray(deps.interactive)
+    ? deps.interactive
+    : (deps.telegram !== null && deps.telegram !== undefined ? [deps.telegram] : [])
+  const interactive = rawInteractive
+    .map((raw) => normalizeInbound(raw))
+    .filter((entry) => entry !== null && entry.channel !== '')
+  const interactiveByChannel = new Map(interactive.map((entry) => [entry.channel, entry]))
+  // v0.6.4：交互渠道名集合（编号回复 intended 兜底用——真实装配里能回话到 bus 的
+  // 通道必然在此集合内，广播也必然覆盖它们）
+  const interactiveChannels = new Set(interactive.map((entry) => entry.channel))
+  // C2（P1-5）：本 router 实例中仍有存活 waiter 的审批 key 集合。
+  // 崩溃/写盘失败会留下 status=pending 但 waiter 已死的僵尸行；latestPendingFor
+  // 只放行 liveWaiters 中仍存在的 key，防止僵尸行吞掉后续编号回复并误导回执。
+  const liveWaiters = new Set()
+  // 升级提醒里的按钮渠道提示（无交互渠道时退化为纯编号回复话术）
+  const cardChannelNames = interactive
+    .map((entry) => DISPLAY_NAMES[entry.channel] ?? entry.channel)
+    .join('/')
+
+  // Interaction Core：ap: 行统一状态机（pending→resolved，decision 终态裁决）。
+  // latestPendingFor 归属/兜底启发式（exact/onChannel/intended + liveWaiters 僵尸过滤）
+  // 是审批特有语义，保留在链内——核心只提供原子账本操作（见 interaction/ledger.mjs）。
+  const core = createInteractionLedger({ keyPrefix: 'ap:', store })
+  /**
+   * 最近一条待决审批（编号回复降级用）。匹配优先级：
+   *  1) 精确：卡片实际送达过该 (channel,userId)；
+   *  2) 同渠道：卡片送达过该 channel（他人代决兜底）；
+   *  3) v0.6.4 intended 兜底：该 channel 属于本审批的意图送达渠道（分流解析结果；
+   *     全局广播时 = 全部交互渠道）——堵住「卡片发送失败但广播文案教用户回复 1」的死路
+   *     （审查 R1-P2-1）。注意 intended 只做 channel 级（广播无用户定向），跨渠道的
+   *     非意图渠道（如分流只发 feishu 时 telegram 的日常裸 1）仍拒绝——收紧价值保留。
+   * CRACK-003：返回值带 evidence（exact|onChannel|intended）——编号回复归属闸据此区分
+   * 「卡片发本人」与「同渠道他人卡片/广播兜底」，后者仅 owner 可代决（fail-closed）。
+   */
+  const deliveryTargets = (row) => [
+    ...(Array.isArray(row?.pushedTo) ? row.pushedTo : []),
+    ...(Array.isArray(row?.hintTargets) ? row.hintTargets : []),
+  ]
+
+  const latestPendingFor = (channel, userId, accountId = undefined) => {
+    let exact = null
+    let onChannel = null
+    let intended = null
+    for (const key of core.scanKeys()) {
+      const row = core.get(key)
+      // C2（P1-5）：无存活 waiter 的 pending 行不参与编号回复匹配。
+      // 进程崩溃、重启或 ledger.resolve 写盘失败会留下 pending 僵尸行；跳过它们
+      // 让后续真实待决审批仍有机会被裁决，也避免「已被处理」误导回执。
+      if (!core.isPending(row) || !liveWaiters.has(key)) continue
+      const pushed = deliveryTargets(row)
+      const accountMatches = (target) => target.accountId === undefined || String(target.accountId) === String(accountId ?? '')
+      if (pushed.some((target) => target.channel === channel && accountMatches(target))) {
+        if (onChannel === null || row.createdAt > onChannel.row.createdAt) onChannel = { key, row, evidence: 'onChannel' }
+        if (pushed.some((target) => target.channel === channel && accountMatches(target) && String(target.userId) === String(userId))) {
+          if (exact === null || row.createdAt > exact.row.createdAt) exact = { key, row, evidence: 'exact' }
+        }
+      }
+      if (intended === null && isIntendedChannel(row, channel)) intended = { key, row, evidence: 'intended' }
+    }
+    return exact ?? onChannel ?? intended
+  }
+  // 核心账本 + 审批专用归属启发式合成同一 ledger 面（其余调用点零改动）。
+  const ledger = { ...core, latestPendingFor }
+
+  /**
+   * v0.13（C11.5 / R5）：审批终态的唯一 transition owner（durable-first，绝不伪装成功）。
+   * - 行非 pending（已有权威落定者）→ 不二次写，返回 already-resolved（消除冗余的第二次 resolve）；
+   * - durable 落盘失败 → 尽力写 uncertain 恢复标记，使重启后不再当作正常 live pending；
+   * - 行缺失 → missing（无事可清，与 resolve 旧语义一致，不阻塞交还桌面）。
+   * @returns {{ ok: boolean, wrote: boolean, uncertain: boolean, reason: string }}
+   */
+  const finalizeApproval = (key, decision, extra = {}) => {
+    const row = ledger.get(key)
+    if (row === undefined) return { ok: false, wrote: false, uncertain: false, reason: 'missing' }
+    if (!ledger.isPending(row)) return { ok: true, wrote: false, uncertain: false, reason: 'already-resolved' }
+    const settled = ledger.settle(key, decision, extra)
+    if (settled.ok !== true) {
+      warn(`审批 ${key} 终态未落盘（${settled.reason}）${settled.uncertain ? '，已标记 uncertain' : '，恢复标记亦失败'}`)
+    }
+    return { ok: settled.ok === true, wrote: settled.ok === true, uncertain: settled.uncertain === true, reason: settled.reason }
+  }
+
+  /**
+   * v0.13（C11.5 / R5）：terminate 的 durable-first 包装——落盘失败时标记 uncertain，
+   * 绝不把未落盘的终止伪装成已终止（重启后不再当 live pending）。
+   */
+  const terminateDurable = (key) => {
+    let result
+    try { result = ledger.terminate(key) } catch { return false }
+    if (result === 'storage-failed') {
+      const recovered = ledger.markUncertain(key, 'terminal-persist-failed')
+      warn(`审批 ${key} 终止未落盘${recovered ? '，已标记 uncertain' : '，恢复标记亦失败'}`)
+    }
+    return result
+  }
+
+  /**
+   * Control Core settlement order: validate the token first, claim the
+   * durable interaction row, then release the in-memory waiter.  A failed
+   * durable write therefore cannot deliver a host decision.
+   */
+  function settleThroughLedger(input) {
+    const key = input.approvalKey ?? input.key
+    const decision = input.decision
+    if (decision !== OUTCOME_ALLOWED && decision !== OUTCOME_REJECTED) return false
+    if (input.trusted !== true) {
+      let verdict
+      try { verdict = vault.verify(input.token) } catch { return false }
+      if (verdict?.ok !== true || verdict.key !== key) return false
+    }
+    const finalized = finalizeApproval(key, decision, { via: String(input.via ?? ''), userId: String(input.userId ?? '') })
+    if (finalized.ok !== true || finalized.wrote !== true) {
+      return { ok: false, reason: finalized.reason === 'storage-failed' ? 'storage-failed' : 'already-resolved' }
+    }
+    // A durable winner is authoritative even if the live waiter disappeared
+    // between lookup and delivery; no second durable write is attempted.
+    bus.settle(key, decision, input.via, input.userId)
+    return { ok: true }
+  }
+
+  // G-34（D5）：文本线 5min 抑制判定——行已翻终态（裁决成功/终止/超时/失效）且在窗口内，
+  // 同 key 的广播与升级链文本不再推送。窗口由 resolvedAt 表达：只有真实裁决才写终态，
+  // pending 行（observe 旁观中）永不抑制。
+  const textLineSuppressed = (key) => {
+    const row = ledger.get(key)
+    return row !== undefined && row !== null
+      && row.status !== 'pending'
+      && typeof row.resolvedAt === 'number'
+      && Date.now() - row.resolvedAt < TEXT_SUPPRESS_WINDOW_MS
+  }
+
+  if (deps.control !== null && deps.control !== undefined) {
+    deps.control.register('approval', {
+      getPending: (input) => ledger.get(input.approvalKey ?? input.key),
+      buildEvent: (input, row, policy, now) => {
+        const channel = String(input.channel ?? String(input.via ?? '').split(':')[0] ?? '')
+        const chatId = String(input.chatId ?? '')
+        const candidates = String(input.via ?? '').endsWith(':button')
+          ? (Array.isArray(row.pushedTo) ? row.pushedTo : [])
+          : deliveryTargets(row)
+        const exact = candidates.find((target) => String(target.channel) === channel && String(target.chatId) === chatId && (target.accountId === undefined || String(target.accountId) === String(input.accountId ?? '')))
+        return {
+          eventId: input.eventId,
+          sessionId: String(row.agentId ?? input.approvalKey ?? input.key), source: 'mobile', channel,
+          accountId: String(exact?.accountId ?? input.accountId ?? ''), userId: String(exact?.userId ?? input.userId ?? ''), chatId,
+          policyVersion: String(row.policyVersion ?? policy.policyVersion ?? '1'), command: 'approval',
+          chatType: input.chatType, createdAt: Number(row.createdAt ?? now - 1),
+          expiresAt: Number(row.expiresAt ?? now + timeoutMs),
+        }
+      },
+      authorize: (input, row, event) => {
+        const candidates = String(input.via ?? '').endsWith(':button')
+          ? (Array.isArray(row.pushedTo) ? row.pushedTo : [])
+          : deliveryTargets(row)
+        const exact = candidates.some((target) => (
+          String(target.channel) === event.channel
+          && String(target.chatId) === event.chatId
+          && (target.accountId === undefined || String(target.accountId) === event.accountId)
+          && (target.userId === undefined || String(target.userId) === event.userId)
+        ))
+        if (input.trusted !== true) return exact
+        return exact || isAuthorizedDecider(identity, event.channel, event.userId)
+      },
+      settle: (input) => settleThroughLedger(input),
+    })
+  }
+
+  /** v0.6.4：row 的意图渠道判定——intended 数组含该渠道，或 null（全局广播）时任意交互渠道。 */
+  function isIntendedChannel(row, channel) {
+    if (Array.isArray(row.intendedChannels)) return row.intendedChannels.includes(channel)
+    if (row.intendedChannels === null) return interactiveChannels.has(channel)
+    return false // 旧版行无此字段：不兜底（从严，升级瞬间的在途审批最多超时回退）
+  }
+
+  /**
+   * v0.3.2 审批分流：request.agent 有 id 时按 agent 解析链算目标通道集合。
+   * 返回 null = 不分流（全局广播，向后兼容）；解析异常同样回落 null。
+   */
+  function resolveApprovalChannels(request) {
+    if (router === null) return null
+    const agentId = request?.agent?.id ?? request?.agent?.session?.id ?? null
+    if (agentId === null) return null
+    try {
+      const globalTypes = Array.isArray(notifier?.channels) ? notifier.channels : []
+      const { channelTypes } = router.resolveOutbound(String(agentId), workspaceOf(request.agent), globalTypes)
+      if (!Array.isArray(channelTypes)) return channelTypes
+      const merged = new Set(channelTypes)
+      for (const type of channelTypes) {
+        const alias = toInboundChannelName(String(type))
+        if (alias !== type) merged.add(alias)
+      }
+      return [...merged]
+    } catch (error) {
+      // P1-2 错误可见性（2026-08-20，Trae1）：路由解析异常与「空集」同样回落全局广播
+      // （fail-safe 投递语义不变），但异常路径原先零日志——同函数的空集回落自 v0.6.5
+      // 起就有 warn，异常反而静默，路由子系统坏了会无声地把审批卡广播到全渠道。
+      warn(`审批分流解析异常，回落全局广播（路由引擎报错: ${error instanceof Error ? error.message : String(error)}）`)
+      return null
+    }
+  }
+
+  /**
+   * v0.8.3 SEC-1：规划本次审批的卡片目标（与推送共用同一份结果，避免 wait 的
+   * allowChats 与 pushApproval 各自解析导致的不一致）。返回 Map<channel, kept[]>。
+   */
+  function planApprovalTargets(channelTypes) {
+    const targets = new Map()
+    for (const inbound of interactive) {
+      if (channelTypes !== null && !channelTypes.includes(inbound.channel)) continue
+      // v0.7 形状守卫（计划书 §3.5）：目标进发送前按渠道校验 id 形态——TG 数字 id 混进
+      // 飞书目标位这类跨渠道串门在此拦截（warn + skip，不中断其余目标）。
+      const { kept, skipped } = guardTargets(inbound.channel, inbound.notifyTargets(), warn)
+      if (skipped.length > 0) warn(`形状守卫跳过 ${skipped.length} 个目标（${inbound.channel}）`)
+      targets.set(inbound.channel, kept)
+    }
+    return targets
+  }
+
+  async function pushApproval(key, token, request, channelTypes, targetsByChannel) {
+    const title = t.approval.cardTitle(request.toolName)
+    // S-05：reason 是 agent 生成文本，minimal（默认）打码密钥形态后外发
+    const rawReason = typeof request.reason === 'string' && request.reason !== '' ? request.reason : t.approval.reasonFallback
+    const reason = redaction === 'minimal' ? maskSecrets(rawReason) : rawReason
+    const content = t.approval.content(reason)
+    const pushedTo = []
+    const hintTargets = []
+    const buttonChannels = []
+    const textChannels = []
+    // 交互渠道：带按钮卡片（逐通道逐目标推送；单渠道失败降级为纯通知）。
+    // v0.3.2 分流：channelTypes 非空时只推解析出的通道（审批不广播到无关 agent 的通道）。
+    // v0.6.4 增量落账（审查 R1-P1-1）：pushedTo 原来要等整轮推送（多通道限速门下数秒）
+    // 完成才写账——窗口内早到的编号回复读不到送达渠道，裁决落空且裸「1」漏进会话
+    // 路由。现在每张卡送达立刻落账，窗口收敛到单卡发送耗时。
+    const persistPushed = () => {
+      try {
+        const row = ledger.get(key)
+        if (row !== undefined && setDurable(store, key, { ...row, pushedTo: [...pushedTo], hintTargets: [...hintTargets] }) !== true) {
+          warn(`审批 ${key} 增量送达证据未落盘`)
+        }
+      } catch { /* 增量落账失败不致命，末尾还有一次整体落账兜底 */ }
+    }
+    const fallbackText = t.approval.fallbackText(title, content)
+    for (const [channel, kept] of targetsByChannel) {
+      const inbound = interactiveByChannel.get(channel)
+      if (inbound === undefined) continue
+      let anySuccess = false
+      for (const target of kept) {
+        const card = await inbound.sendApprovalCard({
+          chatId: target.chatId,
+          title,
+          content,
+          approvalKey: key,
+          token,
+        })
+        // Provider-level group downgrade is deliberately not delivery evidence:
+        // no native button exists and the target must not become a pushedTo
+        // authorization source. A downgraded result also suppresses the
+        // generic numbered-text fallback, which would otherwise leak context.
+        if (card !== null && card?.downgraded !== true) {
+          anySuccess = true
+          pushedTo.push({ channel, ...(inbound.accountId === undefined ? {} : { accountId: String(inbound.accountId ?? '') }), chatId: target.chatId, userId: target.userId, messageId: card.messageId })
+          persistPushed()
+        } else if (card?.downgraded !== true && await inbound.sendText(target.chatId, fallbackText)) {
+          // Native renderer failure gets a direct per-chat text fallback. This target is
+          // authorization evidence; channel-level notifier broadcasts are never evidence.
+          hintTargets.push({ channel, ...(inbound.accountId === undefined ? {} : { accountId: String(inbound.accountId ?? '') }), chatId: target.chatId, userId: target.userId })
+          persistPushed()
+        }
+      }
+      if (anySuccess) {
+        const name = DISPLAY_NAMES[channel] ?? channel
+        if (inbound.capabilities?.buttons !== false) buttonChannels.push(name)
+        else textChannels.push(name)
+      }
+    }
+    // 全渠道通知（含单向渠道；无按钮渠道靠编号回复降级）。原生卡失败时已先尝试
+    // 直接 sendText 到同一 chat，并将成功目标写入 hintTargets；广播本身不提供授权证据。
+    // 按钮渠道提示可点；无按钮渠道提示编号回复——单向广播渠道（bark 等）同样
+    // 依赖「回复 1 批准 / 2 拒绝」兜底，因此按钮场景也保留该提示（v0.2.0 文案契约）。
+    const channelNotes = []
+    if (buttonChannels.length > 0) channelNotes.push(t.approval.sentButtonNote(buttonChannels))
+    if (textChannels.length > 0) channelNotes.push(t.approval.sentNoticeNote(textChannels))
+    const outbound = new Set(Array.isArray(notifier?.channels) ? notifier.channels : [])
+    const carded = new Set(pushedTo.map((target) => String(target.channel)))
+    const broadcastTypes = channelTypes === null
+      ? null
+      : channelTypes.filter((type) => {
+        const alias = toInboundChannelName(String(type))
+        return alias === type || !carded.has(alias)
+      }).filter((type) => outbound.size === 0 || outbound.has(type))
+    if (broadcastTypes !== null && broadcastTypes.length === 0) return { pushedTo, hintTargets }
+    // G-34（D5）：早到的裁决（waiter 预注册窗口内用户已点卡）已把行翻终态——广播文本
+    // 此时只会造成"已批卡片 + 还在等待批准"双响，直接抑制。
+    if (textLineSuppressed(key)) return { pushedTo, hintTargets }
+    await notifier.notifyAll({
+      title,
+      content: `${content}\n\n${channelNotes.length > 0
+        ? t.approval.broadcastWithNotes(channelNotes)
+        : t.approval.broadcastNoButtons}`,
+      level: 'timeSensitive',
+    }, broadcastTypes !== null ? { channelTypes: broadcastTypes } : {}).catch(() => {})
+    return { pushedTo, hintTargets }
+  }
+
+  async function markRemoteResolved(pushedTo, text) {
+    for (const target of pushedTo ?? []) {
+      const inbound = interactiveByChannel.get(target.channel)
+      if (inbound === undefined) continue
+      await inbound.editTarget(target, text)
+    }
+  }
+
+  // Explicit button action path. The payload is bound to its original key and
+  // token; no "latest pending" heuristic is used, including for group chats.
+  function handleApprovalAction(envelope) {
+    let action = envelope?.approvalAction
+    if (action === null || action === undefined) {
+      const text = String(envelope?.text ?? '').trim()
+      if (!text.startsWith('ap:')) return false
+      const parsed = parseApprovalAction(text)
+      if (parsed === null) return false
+      action = parsed
+    }
+    if (action === null || typeof action !== 'object') return false
+    const key = String(action.approvalKey ?? '')
+    const decision = action.decision === OUTCOME_ALLOWED || action.decision === OUTCOME_REJECTED ? action.decision : null
+    if (key === '' || decision === null) return false
+    const row = ledger.get(key)
+    const reply = (message) => {
+      const inbound = interactiveByChannel.get(envelope.channel)
+      if (inbound !== undefined) void inbound.sendText(envelope.chatId, message).catch(() => {})
+    }
+    if (row === undefined || row.status !== 'pending') {
+      reply(t.approval.alreadyResolved)
+      return true
+    }
+    const targets = (Array.isArray(row.pushedTo) ? row.pushedTo : []).filter((target) => String(target.channel) === String(envelope.channel) && (target.accountId === undefined || String(target.accountId) === String(envelope.accountId ?? '')))
+    // G-41（2026-08-28）：去掉原 `targets.length > 0 &&` 门控——pushedTo 为空表（或该
+    // 渠道/账号无投递记录）时同样执行接收人比对。空表意味着「无法证明投递对象」：
+    // 按钮 token 虽只随卡片下发，纵深上仍不得在无法证明回复来源时放行（原形态会跳过
+    // 比对直落 Control Core，只剩 authorize 一道内部防线，且回执话术误导为「已处理」）。
+    // 取舍：增量落账窗口（persistPushed 前的单卡发送耗时）与写盘失败造成的临时空表
+    // 在此退化为「拒绝直到账本一致」——用户回桌面或稍后重点，方向与 fail-closed 一致，
+    // 只收紧不放宽。
+    if (!targets.some((target) => String(target.userId) === String(envelope.userId))) {
+      if (targets.length === 0) {
+        warn(`审批按钮来源无法核验（无投递记录）：${key}（channel ${envelope.channel}，user ${envelope.userId}）`)
+        reply(t.approval.noDeliveryRecord)
+      } else {
+        reply(t.approval.receiverOnly)
+      }
+      return true
+    }
+    // v0.8.7：accountId 缺失时不得用 channel 名伪造——fail-closed 交还桌面。
+    // 旧客户端回调可能不含 accountId，此时无法证明来源账号，不能放行。
+    if (envelope.accountId === undefined || envelope.accountId === null || String(envelope.accountId) === '') {
+      reply(t.approval.missingAccountCallback)
+      return true
+    }
+    const verdict = deps.control !== null && deps.control !== undefined
+      ? deps.control.handle({
+        eventId: String(envelope.messageId ?? ''), command: 'approval', approvalKey: key, decision,
+        token: typeof action.token === 'string' ? action.token : undefined,
+        via: `${envelope.channel}:button`, channel: envelope.channel,
+        accountId: String(envelope.accountId), userId: envelope.userId,
+        chatId: envelope.chatId, chatType: envelope.chatType,
+      })
+      : { ok: false, message: t.approval.controlNotWired }
+    if (!(verdict.ok === true || verdict.status === 'accepted')) reply(verdict.message ?? t.approval.alreadyResolved)
+    return true
+  }
+
+  // G-31：显式优先级——卡片动作线最先（ap: 负载是显式意图，绝不落入会话路由）。
+  const disposeApprovalAction = bus.onMessage(handleApprovalAction, { priority: MESSAGE_PRIORITY.cardAction })
+
+  // 编号回复降级（无按钮渠道）：白名单用户回复 1/2 核销最近一条待决审批。
+  // v0.6.3 返回 true = 消息已被审批消费——bus 据此停止扇出，同一消息不再进对话路由
+  // （原实现「1」既批准审批又被当作用户消息 inject 进 agent 会话，消息污染）。
+  function handleNumberedReply(envelope) {
+    if (approvalConfig.numberedReply === false) return false
+    const choice = String(envelope.text ?? '').trim()
+    if (choice !== '1' && choice !== '2') return false
+    const pending = ledger.latestPendingFor(envelope.channel, envelope.userId, envelope.accountId)
+    if (pending === null) return false
+    // CRACK-003 归属闸：exact（卡片发本人）直接放行；onChannel/intended 属他人卡片或
+    // 广播兜底——仅 owner 可代决。identity 缺失/异常一律 fail-closed 拒绝。
+    const allowed = pending.evidence === 'exact' || isAuthorizedDecider(identity, envelope.channel, envelope.userId)
+    if (!allowed) {
+      warn(`编号回复归属拒绝 ${pending.key}（evidence=${pending.evidence}，user ${envelope.userId} 非 owner）`)
+      const inbound = interactiveByChannel.get(envelope.channel)
+      if (inbound !== undefined) {
+        void inbound.sendText(envelope.chatId, t.approval.notForYou).catch(() => {})
+      }
+      return true
+    }
+    const decision = choice === '1' ? OUTCOME_ALLOWED : OUTCOME_REJECTED
+    // v0.8.7：编号回复同样要求 accountId 来源——缺失时 fail-closed。
+    if (envelope.accountId === undefined || envelope.accountId === null || String(envelope.accountId) === '') {
+      const inbound = interactiveByChannel.get(envelope.channel)
+      if (inbound !== undefined) void inbound.sendText(envelope.chatId, t.approval.missingAccountReply).catch(() => {})
+      return true
+    }
+    const verdict = deps.control !== null && deps.control !== undefined
+      ? deps.control.handle({ eventId: String(envelope.messageId ?? ''), command: 'approval', approvalKey: pending.key, channel: envelope.channel, accountId: String(envelope.accountId), chatId: envelope.chatId, chatType: envelope.chatType, userId: envelope.userId, via: `${envelope.channel}:reply`, decision, trusted: true })
+      : { ok: false, message: t.approval.controlNotWired }
+    if (verdict.ok === true || verdict.status === 'accepted') {
+      warn(`编号回复裁决 ${pending.key} → ${decision}（user ${envelope.userId}）`)
+      return true
+    }
+    // v0.8.3 E-2：已决竞态（首达采纳/超时已 settle，账本暂未翻终态）——消费 + 回执，
+    // 不把裸 '1'/'2' 漏进对话路由（对齐 questions/router.mjs:316-318 既有姿态）。
+    const inbound = interactiveByChannel.get(envelope.channel)
+    if (inbound !== undefined) {
+      void inbound.sendText(envelope.chatId, t.approval.alreadyDecidedRace).catch(() => {})
+    }
+    warn(`编号回复落空 ${pending.key}（已决竞态，user ${envelope.userId}）`)
+    return true
+  }
+
+  const disposeMessage = bus.onMessage(handleNumberedReply, { priority: MESSAGE_PRIORITY.numberedReply })
+
+  /** CRACK-003：编号回复代决资格——仅该渠道绑定的 owner 可代决他人卡片；identity 缺失/异常 fail-closed。 */
+  function isAuthorizedDecider(identity, channel, userId) {
+    if (!identity) return false
+    try { return identity.list(channel).some((r) => String(r.userId) === String(userId) && r.role === 'owner') } catch { return false }
+  }
+
+  const handler = async (request, next) => {
+    const key = `ap:${request?.callId ?? request?.toolName ?? 'unknown'}:${(counter += 1)}`
+    try {
+      const token = vault.mint(key)
+      // 分流一次解析、全程复用（v0.6.4：pushApproval 落账与升级链共用同一份结果，
+      // 原二处各自 resolve 在 agent 绑定轮转瞬间可能不一致）。
+      const resolved = resolveApprovalChannels(request)
+      // v0.6.5（审查 R4-1-P3-5）：空集回落全局广播——agent 显式绑定空集或绑定渠道
+      // 全被全局池剔除时，原实现零卡零广播，审批 120s 无感知超时（安全侧自洽但用户
+      // 完全不知道为何「卡死」）。intendedChannels 同步记 null，与实际广播语义一致。
+      const channelTypes = Array.isArray(resolved) && resolved.length > 0 ? resolved : null
+      if (channelTypes === null && resolved !== null) {
+        warn('审批分流解析为空集，回落全局广播（检查该 agent 的路由绑定与全局渠道池）')
+      }
+      if (ledger.add(key, {
+        mode,
+        toolName: request?.toolName ?? '(unknown)',
+        agentId: request?.agent?.id ?? request?.agent?.session?.id ?? null,
+        pushedTo: [],
+        // v0.6.4（审查 R1-P2-1）：意图渠道入账——null = 全局广播（= 全部交互渠道），
+        // 数组 = 分流结果。编号回复 intended 兜底据此判定「广播教了回复 1 但卡片没送达」。
+        intendedChannels: channelTypes,
+        expiresAt: Date.now() + timeoutMs,
+      }) !== true) {
+        warn(`审批 ${key} 账本未落盘，交还桌面`)
+        return next()
+      }
+      // v0.6.3 waiter 预注册（审查 R2 P1-1）：原实现先 await pushApproval（逐通道逐目标
+      // 发卡 + 广播，限速门下数秒级）再 bus.wait——窗口内用户点按钮/回复 1/2 会命中
+      // already-resolved 被静默丢弃，此后永远无人能裁决 → 超时回落桌面。先注册 waiter
+      // 再推卡，早到的裁决由 waiter 承接（超时计时从推卡开始，含推送耗时，语义可接受）。
+      // v0.8.3 SEC-1：wait 同时登记允许会话范围（allowChats），bus.decide 据此校验按钮来源。
+      const targetsByChannel = planApprovalTargets(channelTypes)
+      const allowChats = new Map()
+      for (const [channel, kept] of targetsByChannel) {
+        if (kept.length === 0) continue
+        allowChats.set(channel, new Set(kept.map((target) => String(target.chatId))))
+      }
+      const waitOptions = {
+        agentId: request?.agent?.id ?? request?.agent?.session?.id ?? null,
+        onAbandon: () => { terminateDurable(key) },
+        allowChats,
+      }
+      const decisionPromise = mode === 'answer'
+        ? Promise.resolve().then(() => bus.wait(key, timeoutMs, waitOptions)).catch((error) => {
+          warn(`远程审批等待异常，按超时交还桌面: ${error instanceof Error ? error.message : String(error)}`)
+          return null
+        })
+        : null
+      if (decisionPromise !== null) {
+        liveWaiters.add(key)
+        decisionPromise.then(
+          () => { liveWaiters.delete(key) },
+          () => { liveWaiters.delete(key) },
+        )
+      }
+      const delivery = await pushApproval(key, token, request, channelTypes, targetsByChannel)
+      const pushedTo = delivery.pushedTo
+      const row = ledger.get(key)
+      if (row !== undefined && row.status === 'pending') {
+        if (setDurable(store, key, { ...row, pushedTo, hintTargets: delivery.hintTargets }) !== true) {
+          warn(`审批 ${key} 最终送达证据未落盘`)
+        }
+      }
+      if (ledger.get(key)?.decision === 'terminated') {
+        await markRemoteResolved(pushedTo, t.approval.terminatedCard)
+        return next()
+      }
+
+      if (mode !== 'answer') {
+        return next() // observe：只旁观，桌面照常决定
+      }
+
+      // Explicit opt-in only. The default remains exclusive desktop-first
+      // waiting; this branch never changes permissions or token semantics.
+      if (approvalConfig.parallel === true) {
+        const desktopAsk = Promise.resolve().then(() => next())
+        desktopAsk.catch(() => {})
+        const race = await new Promise((resolve) => {
+          let settled = false
+          const finish = (value) => { if (!settled) { settled = true; resolve(value) } }
+          decisionPromise.then((decision) => {
+            if (decision !== null) finish({ kind: 'remote', decision })
+            else {
+              const finalized = finalizeApproval(key, 'timeout')
+              void markRemoteResolved(pushedTo, finalized.ok === true ? t.approval.parallelTimeout : t.approval.terminalUncertain).catch(() => {})
+            }
+          }).catch(() => {})
+          desktopAsk.then((result) => finish({ kind: 'desktop', result }), () => finish({ kind: 'desktop', result: undefined }))
+        })
+        if (race.kind === 'remote') {
+          // 控制面路径已由 settleThroughLedger 权威落定；legacy bus 路径在此补齐（单一 owner，非 pending 不二次写）。
+          finalizeApproval(key, race.decision.decision, { via: String(race.decision.via ?? ''), userId: String(race.decision.userId ?? '') })
+          await markRemoteResolved(pushedTo, race.decision.decision === OUTCOME_ALLOWED ? t.approval.remoteApproved : t.approval.remoteRejected)
+          return race.decision.decision
+        }
+        try { bus.abandon?.(key, 'desktop-first') } catch { }
+        terminateDurable(key)
+        await markRemoteResolved(pushedTo, t.approval.desktopHandled)
+        return race.result
+      }
+
+      // 升级链与 wait 并行：每到一个 stage 再推一轮更高 level 提醒
+      const startedAt = Date.now()
+      escalation.start(key, (_key, stage) => {
+        // G-34（D5）：升级链文本同样受 5min 抑制——卡片已裁决的审批不再"仍在等待批准"
+        // （escalation.stop 在裁决后调用，这里兜住 stop 前的已触发 stage 竞态）。
+        if (textLineSuppressed(key)) return
+        notifier.notifyAll({
+          title: t.approval.escStillWaiting(request?.toolName),
+          content: t.approval.escContent(stage.note ?? t.approval.escNoteFallback, Math.round((Date.now() - startedAt) / 1000), cardChannelNames),
+          level: stage.level ?? 'timeSensitive',
+        }, channelTypes !== null ? { channelTypes } : {}).catch(() => {})
+      })
+
+      const decision = await decisionPromise
+      escalation.stop(key)
+      if (ledger.get(key)?.decision === 'terminated') {
+        await markRemoteResolved(pushedTo, t.approval.terminatedCard)
+        return next()
+      }
+      if (decision === null) {
+        const finalized = finalizeApproval(key, 'timeout')
+        await markRemoteResolved(pushedTo, finalized.ok === true ? t.approval.timeoutResolved : t.approval.terminalUncertain)
+        return next() // 静默永不批准
+      }
+      // 控制面路径已由 settleThroughLedger 权威落定；legacy bus 路径在此补齐（单一 owner，非 pending 不二次写）。
+      finalizeApproval(key, decision.decision, { via: String(decision.via ?? ''), userId: String(decision.userId ?? '') })
+      await markRemoteResolved(pushedTo, decision.decision === OUTCOME_ALLOWED ? t.approval.remoteApproved : t.approval.remoteRejected)
+      warn(`${key} 裁决：${decision.decision}（via ${decision.via}）`)
+      return decision.decision
+    } catch (error) {
+      // A listener never throws：任何异常交还桌面
+      warn(`处理器异常，交还桌面: ${error instanceof Error ? error.message : String(error)}`)
+      try { escalation.stop(key) } catch { /* 升级链清理不致命 */ }
+      finalizeApproval(key, 'error')
+      return next()
+    }
+  }
+
+  // G-16（D4）：启动扫描 ap: pending 行——进程重启/热重载后 waiter 已死而账本行还在
+  // （waiter 纯内存、ledger 持久化，生命周期在重启边界分叉）。全部 pending 行在此刻都
+  // 是僵尸：标记 expired + 向 pushedTo 目标补发失效告知。用户点旧卡片从"已处理"误导
+  // 回执变成明确失效告知；补发失败仅 warn，绝不阻塞启动；宿主侧 promise 由自身超时兜底。
+  const scanStalePendingApprovals = () => {
+    let marked = 0
+    for (const key of core.scanKeys()) {
+      const row = core.get(key)
+      if (!core.isPending(row)) continue
+      const targets = deliveryTargets(row)
+      // v0.13（C11.5 / R5）：durable-first——resolve 返回值必须核对（旧实现只 catch 异常，
+      // 'storage-failed' 会被误当成功计数）。落盘失败时标记 uncertain，重启不再当 live pending。
+      const result = core.resolve(key, 'expired') // 翻终态：decision='expired'，resolvedAt=now
+      if (result !== true) {
+        const recovered = core.markUncertain(key, 'terminal-persist-failed')
+        warn(`重启失效标记未落盘(${key}): ${result}${recovered ? '，已标记 uncertain' : '，恢复标记亦失败'}`)
+        continue
+      }
+      marked += 1
+      for (const target of targets) {
+        const inbound = interactiveByChannel.get(target.channel)
+        if (inbound === undefined) continue
+        void inbound.sendText(target.chatId, t.approval.staleNotice).catch((error) => {
+          warn(`重启失效补发失败(${key} → ${target.channel}/${target.chatId}): ${error instanceof Error ? error.message : String(error)}`)
+        })
+      }
+    }
+    if (marked > 0) warn(`启动扫描: ${marked} 条重启残留审批已标记失效并补发告知`)
+  }
+
+  const disposeApproval = ctx.on('approval/request', handler)
+  // G-16：装配完成后执行一次启动扫描（失败不致命，超时清扫与 token TTL 仍兜底）。
+  try {
+    scanStalePendingApprovals()
+  } catch (error) {
+    warn(`启动扫描异常（继续启动）: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  return () => {
+    disposeApproval?.()
+    disposeApprovalAction?.()
+    disposeMessage?.()
+    escalation.dispose()
+  }
+}

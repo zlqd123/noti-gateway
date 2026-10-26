@@ -1,0 +1,20 @@
+# dsh-notifier-qq bundle patch: inserts the plugin row into the profile roster.
+# Install with `dsh plugin --profile <name> add file:/path/to/dsh-notifier-qq`;
+# the patch layer is applied through the loader on boot.
+#
+# 空配置随插件附带：channels 为空时插件只订阅不动作（绝不弄崩启动）。
+# 本副本会在装配期自动沿用原 dsh-notifier 插件在 profile 里的 qq-bot 配置与持久身份，
+# 因此「只装副本、不重填凭证」即可跑起来；要覆盖请在 profile 的 cordis.patch.yml 里
+# 写 `- id: dsh-notifier-qq` 加 config（显式配置永远优先于借用）。
+- insert:
+    - id: dsh-notifier-qq
+      name: 'dsh-notifier-qq'
+      config:
+        enabled: true
+        debounceMs: 10000
+        summaryMaxChars: 500
+        channels: []
+        # 管理台默认关：本副本的配置继承原插件，通常不需要额外开本机网页管理台。
+        # 需要时在 profile patch 里覆盖 admin.enabled: true（端口须避开 winnat 保留段）。
+        admin:
+          enabled: false

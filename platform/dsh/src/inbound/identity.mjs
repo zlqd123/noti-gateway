@@ -1,0 +1,512 @@
+// dsh-notifier v0.7 inbound/identity.mjs
+// 身份绑定层（v0.7 计划书 §3.1）：把「谁是家里人」从 YAML 不透明字符串提升为运行时对象。
+// 键设计：
+//  - inbound:bindings  → { "<channel>:<userId>": {channel,userId,label,role,pairedAt,lastSeenAt,origin} }
+//  - inbound:pending   → { "<channel>:<userId>": {channel,userId,origin,at,extra} } 待确认绑定（扫码/订阅学习）
+//  - inbound:migrated  → true（一次性迁移标记，防止 YAML 每次启动复活管理台已删成员）
+// 与会话路由键 bind:<channel>:<userId>（conversation.mjs，「这条消息交给哪个 agent」）语义不同，
+// 两键并存互不合并：身份绑定放行，会话绑定才可能被消费。
+// 军规：读失败回退空对象（fail-open 读），写失败由 store 保留 dirty 重试；绝不覆写损坏现场。
+
+import { isValidTargetId } from './target-guard.mjs'
+import { INBOUND_CHANNEL_SET } from './channels-registry.mjs'
+import { setDurable, transactDurable } from './store.mjs'
+
+const KEY_BINDINGS = 'inbound:bindings'
+const KEY_PENDING = 'inbound:pending'
+/** 一次性迁移标记（R5 审查 R5-1-P1-1：无标记则每次启动重播撒，管理台已删成员被 YAML 复活）。 */
+const KEY_MIGRATED = 'inbound:migrated'
+/** lastSeenAt 更新节流：每用户每小时最多一次落盘（避免每条入站消息都全量重写 state.json）。 */
+const LAST_SEEN_THROTTLE_MS = 60 * 60 * 1000
+const VALID_CHANNELS = INBOUND_CHANNEL_SET // G-13：单一事实来源（原内联六通道字面量）
+const VALID_ROLES = new Set(['owner', 'member'])
+const VALID_ORIGINS = new Set(['migrated', 'paired', 'learned', 'confirmed'])
+const DEFAULT_ACCOUNT_ID = 'default'
+
+/**
+ * G-49 身份/路由复合键的**唯一构造点**：`${channel}:${userId}`（会话绑定域由调用方再前缀
+ * `bind:`）。四处键构造全部改引本函数，归一规则单一来源：
+ *  - identity.allows 的读键与 lastSeenAt 写回键（本文件）；
+ *  - conversation 的会话绑定持久化键 `bind:<channel>:<userId>`；
+ *  - agent-router resolveInbound L1 的读键（与 conversation 写键同源才能命中）；
+ *  - registry 入站挂钩的 channel/userId 分量（conversation 构造，镜像本函数规则）。
+ *
+ * 归一策略（大小写收敛）：
+ *  - 两分量 trim：' user ' 与 'user' 同键——当前各适配器输出恰好归一，此修是休眠边界
+ *    封口（不改现网行为，只保证未来空白/大小写漂移不裂键）；
+ *  - channel 收敛小写：渠道是有限小写类型集合（VALID_CHANNELS），大小写漂移同键；
+ *  - userId **不**折叠大小写：渠道侧 id 大小写语义真实存在（wxpusher UID_ 前缀、飞书
+ *    open_id），折叠会让存量盘上键打 miss——只 trim 不折叠。
+ *
+ * 不返回归一后的分量（userId 可含冒号，复合键反切会截断）——需要分量的调用方
+ * （registry 挂钩）在构造处镜像本规则，一致性由 test/identity.test.mjs 与
+ * test/conversation.route.test.mjs 的全链路用例锁死。
+ *
+ * @param {string} channel - 渠道类型（telegram/feishu/qq/wxpusher/wechat/dingtalk）
+ * @param {string} userId - 渠道侧用户 id
+ * @returns {string} 归一复合键 `${channel}:${userId}`
+ */
+export function bindingKey(channel, userId) {
+  const normalizedChannel = String(channel ?? '').trim().toLowerCase()
+  const normalizedUserId = String(userId ?? '').trim()
+  return `${normalizedChannel}:${normalizedUserId}`
+}
+
+/** v0.13 principal 主键：非默认账号使用独立键，避免同一用户跨 bot 账号串权。 */
+export function principalKey(channel, accountId, userId) {
+  const normalizedChannel = String(channel ?? '').trim().toLowerCase()
+  const normalizedAccountId = String(accountId ?? DEFAULT_ACCOUNT_ID).trim() || DEFAULT_ACCOUNT_ID
+  const normalizedUserId = String(userId ?? '').trim()
+  return `${normalizedChannel}:${normalizedAccountId}:${normalizedUserId}`
+}
+
+function normalizeAccountId(accountId) {
+  const value = String(accountId ?? '').trim() || DEFAULT_ACCOUNT_ID
+  if (value.length > 128 || value.includes(':')) return null
+  return value
+}
+
+function keyFor(channel, userId, accountId = undefined) {
+  const account = normalizeAccountId(accountId)
+  if (account === null) return null
+  return account === DEFAULT_ACCOUNT_ID ? bindingKey(channel, userId) : principalKey(channel, account, userId)
+}
+
+/** 归一化单条绑定记录（读盘防御：坏字段回退默认，坏形状整条丢弃）。 */
+function normalizeBinding(raw, fallbackKey) {
+  if (raw === null || typeof raw !== 'object') return null
+  const keyRaw = String(fallbackKey ?? '')
+  const colon = keyRaw.indexOf(':')
+  const channel = colon > 0 ? keyRaw.slice(0, colon) : ''
+  const fallbackUserId = colon > 0 ? keyRaw.slice(colon + 1) : ''
+  const rawAccountId = typeof raw.accountId === 'string' ? raw.accountId.trim() : ''
+  const accountId = normalizeAccountId(rawAccountId)
+  if (accountId === null) return null
+  const record = {
+    channel: typeof raw.channel === 'string' && raw.channel !== '' ? raw.channel : (VALID_CHANNELS.has(channel) ? channel : ''),
+    userId: typeof raw.userId === 'string' && raw.userId !== '' ? raw.userId : fallbackUserId,
+    label: typeof raw.label === 'string' ? raw.label.slice(0, 64) : '',
+    role: VALID_ROLES.has(raw.role) ? raw.role : 'member',
+    pairedAt: typeof raw.pairedAt === 'number' ? raw.pairedAt : 0,
+    lastSeenAt: typeof raw.lastSeenAt === 'number' ? raw.lastSeenAt : 0,
+    origin: VALID_ORIGINS.has(raw.origin) ? raw.origin : 'paired',
+  }
+  if (accountId !== DEFAULT_ACCOUNT_ID) record.accountId = accountId
+  if (!VALID_CHANNELS.has(record.channel) || record.userId === '') return null
+  return record
+}
+
+/** 待确认绑定保留 7 天（R5 审查 R5-3-P3-7：陌生人扫码/订阅写入后无人确认，
+ * 待确认表只增不减——读路径顺手清扫，有变更才写回）。 */
+const PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000
+/** 待确认队列容量上限（与入站去重 FIFO 同量级，防自报 uid 无限膨胀 state）。 */
+const PENDING_MAX = 512
+
+/**
+ * 创建身份绑定层。
+ * @param {object} options
+ * @param {import('./store.mjs').store} [options.store] - 持久化 store（跨进程读收敛由 store 自带）
+ * @param {object} [options.logger] - cordis logger
+ */
+export function createIdentity(options = {}) {
+  const store = options.store ?? null
+  const warn = (message) => {
+    try { options.logger?.warn?.('[dsh-notifier-qq/identity]', message) } catch { /* 日志失败绝不致命 */ }
+    try { console.error('[dsh-notifier-qq/identity]', message) } catch { /* 控制台不可用不致命 */ }
+  }
+
+  /** 读绑定表（store 读收敛让宿主进程半秒内看到 CLI/管理台写入）。 */
+  function readBindings() {
+    if (store === null) return {}
+    const raw = store.get(KEY_BINDINGS, {})
+    return normalizeBindings(raw)
+  }
+
+  function normalizeBindings(raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const out = {}
+    for (const [key, value] of Object.entries(raw)) {
+      const record = normalizeBinding(value, key)
+      if (record !== null) {
+        const canonical = keyFor(record.channel, record.userId, record.accountId)
+        if (canonical !== null) out[canonical] = record
+      }
+    }
+    return out
+  }
+
+  function writeBindings(table) {
+    if (store === null) return true
+    return setDurable(store, KEY_BINDINGS, table)
+  }
+
+  // G-44（W12）：启动时一次性清洗坏绑定键 + 写回 + warn 计数。
+  // 坏键 = 存储键与业务视图无法往返的键：normalizeBinding 判坏形状（整条丢弃），或
+  // 键与归一复合键不一致——bindingKey 收敛空白/大小写后对不上（如 ' telegram:42'、
+  // 'Telegram:42'、'telegram: 42' 这类读路径永远命中不了的幽灵键）。allows() 用
+  // bindingKey 归一查询，这些键只占存储不见天日，是「存储与业务视图长期不一致」的来源，
+  // 读时清洗不写回会让盘上死键无限累积，故本批次改为启动一次性清洗 + 写回。
+  // 只动 inbound:bindings，绝不动 inbound:migrated——白名单重播的一次性守卫若被清洗
+  // 连带清掉，「启动损坏白纸重置」（绑定表全坏读到空白）场景下管理台已删成员会被
+  // YAML 静默复活（删减权收归管理台的契约被推翻），这是本条的放大面，测试必含。
+  const startupCleanup = () => {
+    if (store === null) return
+    let raw
+    try {
+      raw = store.get(KEY_BINDINGS, {})
+    } catch (error) {
+      warn(`坏绑定键启动清洗读表失败（跳过，不阻塞）: ${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return
+    const badKeys = []
+    const cleaned = {}
+    for (const [key, value] of Object.entries(raw)) {
+      const record = normalizeBinding(value, key)
+      if (record === null) { badKeys.push(key); continue }
+      const canonical = keyFor(record.channel, record.userId, record.accountId)
+      if (canonical !== key) { badKeys.push(key); continue }
+      cleaned[key] = record
+    }
+    if (badKeys.length === 0) return // 无死键：零写放大
+    try {
+      if (setDurable(store, KEY_BINDINGS, cleaned) !== true) {
+        warn('坏绑定键清洗写回未落盘（不致命）')
+        return
+      }
+      const preview = badKeys.slice(0, 3).map((k) => String(k).slice(0, 32)).join('、')
+      warn(`坏绑定键启动清洗：${badKeys.length} 条移除（${preview}${badKeys.length > 3 ? '…' : ''}），绑定表与业务视图对齐`)
+    } catch (error) {
+      warn(`坏绑定键清洗写回失败（不致命）: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  startupCleanup()
+
+  function readPending() {
+    if (store === null) return {}
+    const raw = store.get(KEY_PENDING, {})
+    const normalized = normalizePending(raw)
+    const out = normalized.out
+    const expired = normalized.expired
+    if (expired > 0 || Object.keys(out).length !== normalized.rawCount) {
+      try {
+        if (setDurable(store, KEY_PENDING, out) !== true) {
+          warn('待确认绑定清扫写回未落盘（不致命）')
+          return out
+        }
+        warn(`待确认绑定清扫：${expired} 条过期、${normalized.rawCount - Object.keys(out).length - expired} 条坏形状被移除`)
+      } catch (error) {
+        warn(`待确认绑定清扫写回失败（不致命）: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return out
+  }
+
+  function normalizePending(raw, now = Date.now()) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { out: {}, expired: 0, rawCount: 0 }
+    }
+    const out = {}
+    let expired = 0
+    for (const [key, value] of Object.entries(raw)) {
+      if (value === null || typeof value !== 'object') continue
+      // TTL 清扫：超期条目跳过（下面统一写回）
+      if (typeof value.at === 'number' && now - value.at > PENDING_TTL_MS) { expired += 1; continue }
+      // C3：复合键按第一个冒号切分，含冒号的 userId 不得被截断（与 normalizeBinding/parseMemberKey 对齐）
+      const colon = key.indexOf(':')
+      const channel = colon > 0 ? key.slice(0, colon) : ''
+      const fallbackUserId = colon > 0 ? key.slice(colon + 1) : ''
+      const userId = typeof value.userId === 'string' && value.userId !== '' ? value.userId : fallbackUserId
+      const accountId = normalizeAccountId(value.accountId)
+      if (!VALID_CHANNELS.has(channel) || accountId === null || userId === '' || userId.includes(':')) continue
+      const canonical = keyFor(channel, userId, accountId)
+      if (canonical === null) continue
+      out[canonical] = {
+        channel,
+        userId,
+        origin: VALID_ORIGINS.has(value.origin) ? value.origin : 'learned',
+        at: typeof value.at === 'number' ? value.at : 0,
+        extra: value.extra !== null && typeof value.extra === 'object' ? value.extra : {},
+      }
+      if (accountId !== DEFAULT_ACCOUNT_ID) out[canonical].accountId = accountId
+    }
+    return { out, expired, rawCount: Object.keys(raw).length }
+  }
+
+  function addBindingToTable(table, { channel, accountId = DEFAULT_ACCOUNT_ID, userId, label = '', origin = 'paired' } = {}) {
+    if (!VALID_CHANNELS.has(channel)) return { ok: false, reason: 'invalid-channel' }
+    const normalizedAccountId = normalizeAccountId(accountId)
+    if (normalizedAccountId === null) return { ok: false, reason: 'invalid-account' }
+    const uid = String(userId ?? '').trim()
+    if (uid === '' || uid.length > 128) return { ok: false, reason: 'invalid-user' }
+    if (uid.includes(':')) {
+      warn(`拒绝含冒号的 userId 绑定（复合键截断风险）：${channel}:${uid.slice(0, 32)}`)
+      return { ok: false, reason: 'invalid-user' }
+    }
+    const key = keyFor(channel, uid, normalizedAccountId)
+    if (table[key] !== undefined) return { ok: false, reason: 'already-bound' }
+    const record = {
+      channel,
+      userId: uid,
+      label: String(label ?? '').slice(0, 64),
+      role: Object.keys(table).length === 0 ? 'owner' : 'member',
+      pairedAt: Date.now(),
+      lastSeenAt: 0,
+      origin: VALID_ORIGINS.has(origin) ? origin : 'paired',
+    }
+    if (normalizedAccountId !== DEFAULT_ACCOUNT_ID) record.accountId = normalizedAccountId
+    table[key] = record
+    return { ok: true, record }
+  }
+
+  return {
+    /** 复合键准入（v0.7 计划书 §3.1：准入带渠道维度，修跨渠道串扰）。 */
+    allows(channel, userId, accountId = undefined) {
+      if (typeof channel !== 'string' || typeof userId !== 'string') return false
+      // G-49：读键与写回键同走 bindingKey 归一（' user ' 与 'user' 同键），单一构造点
+      // 防读写两侧漂移——若写回用裸 channel 拼键，未来分量归一放宽时会落出
+      // ' telegram :user' 这类永不被读键命中的幽灵重复键。现网适配器输出恰好归一，
+      // 此修是休眠边界封口，不改变现网行为。
+      const key = keyFor(channel, userId, accountId)
+      if (key === null) return false
+      const table = readBindings()
+      const record = table[key]
+      if (record === undefined) return false
+      // lastSeenAt 节流更新（内存判定 + 稀疏落盘，不放大写放大）
+      if (Date.now() - record.lastSeenAt > LAST_SEEN_THROTTLE_MS) {
+        try {
+          record.lastSeenAt = Date.now()
+          writeBindings({ ...table, [key]: record })
+        } catch (error) {
+          warn(`lastSeenAt 更新失败（不致命）: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      return true
+    },
+
+    /** 绑定表是否为空（空 = 引导态判定输入之一，v0.7 计划书 §3.2）。 */
+    isEmpty() {
+      return Object.keys(readBindings()).length === 0
+    },
+
+    /** 绑定数（启动日志/管理台总览用）。 */
+    size() {
+      return Object.keys(readBindings()).length
+    },
+
+    /** 全量绑定列表（可选按渠道过滤；管理台成员页/目标解析用）。 */
+    list(channel = '') {
+      const table = readBindings()
+      const records = Object.values(table)
+      return channel === '' ? records : records.filter((record) => record.channel === channel)
+    },
+
+    /** owner 数量（末位 owner 守卫用）。 */
+    ownerCount() {
+      return this.list().filter((record) => record.role === 'owner').length
+    },
+
+    /**
+     * v0.7 迁移（计划书 §3.1）：YAML allowUsers 播撒为绑定记录。
+     * **一次性**（R5 审查 R5-1-P1-1）：落 `inbound:migrated` 标记后永不再播撒——否则每次
+     * 启动重跑「只增不减」，管理台删除的成员（origin=migrated）下次重启被 YAML 静默复活，
+     * 删减权收归管理台单一入口的契约被推翻。副作用：首启时未就绪的通道不补播（用 /pair 或
+     * 管理台补齐），复活已删成员的风险远大于补播便利。
+     * 播撒按渠道 id 形态过滤（R5 审查 R5-3-P1-3）：TG 数字 id 不播给飞书（异形状占据一级
+     * 解析后遮蔽通道自己的配置清单）。
+     * 绑定表为空时首条播撒记录置 owner（R5 审查 R5-1-P2-2：迁移实例 ownerCount 恒 0，
+     * 违反「首位成员即 owner」契约且 bootstrap 永不铸造）。
+     * @param {string[]} allowUsers - YAML 白名单（裸字符串，无法反查渠道 → 对每个已启用通道各播一条）
+     * @param {string[]} enabledChannels - 本次启动实际启用的入站通道
+     */
+    migrate(allowUsers, enabledChannels) {
+      const ids = (Array.isArray(allowUsers) ? allowUsers : []).map((id) => String(id).trim()).filter((id) => id !== '')
+      const channels = (Array.isArray(enabledChannels) ? enabledChannels : []).filter((channel) => VALID_CHANNELS.has(channel))
+      if (ids.length === 0 || channels.length === 0) return { added: 0, skipped: false }
+      if (store !== null && store.get(KEY_MIGRATED, false) === true) return { added: 0, skipped: true }
+      const table = readBindings()
+      const now = Date.now()
+      const wasEmpty = Object.keys(table).length === 0
+      let ownerAssigned = false
+      let added = 0
+      for (const userId of ids) {
+        for (const channel of channels) {
+          // 渠道形态过滤：该渠道显然不接受的 id 不播（如 feishu 不吃裸数字、TG 不吃 UID_）
+          if (!isValidTargetId(channel, userId)) continue
+          const key = keyFor(channel, userId, DEFAULT_ACCOUNT_ID)
+          if (table[key] !== undefined) continue
+          // 空表首条（跨通道也只此一条）置 owner——「首位成员即 owner」契约
+          const role = wasEmpty && !ownerAssigned ? 'owner' : 'member'
+          if (role === 'owner') ownerAssigned = true
+          table[key] = { channel, userId, label: '', role, pairedAt: now, lastSeenAt: 0, origin: 'migrated' }
+          added += 1
+        }
+      }
+      if (added > 0) {
+        if (writeBindings(table) !== true) return { added: 0, reason: 'storage-failed' }
+        warn(`白名单迁移：${added} 条绑定落盘（一次性导入完成，此后增删以管理台为准）`)
+      }
+      if (store !== null && setDurable(store, KEY_MIGRATED, true) !== true) {
+        return { added: 0, reason: 'storage-failed' }
+      }
+      return { added }
+    },
+
+    /**
+     * 新增绑定（配对核销/待确认转正）。首条绑定为 owner（配对语义：bootstrap 单胜也走这里）。
+     * @returns {{ ok: boolean, record?: object, reason?: string }}
+     */
+    addBinding({ channel, accountId = DEFAULT_ACCOUNT_ID, userId, label = '', origin = 'paired' }) {
+      const table = readBindings()
+      const result = addBindingToTable(table, { channel, accountId, userId, label, origin })
+      if (result.ok !== true) return result
+      if (writeBindings(table) !== true) return { ok: false, reason: 'storage-failed' }
+      return result
+    },
+
+    /**
+     * C4 application transaction hook：只在 detached state draft 上准备绑定，
+     * 供 pairing 将「码核销 + 绑定 + 锁出清理」一次提交。不会自行写盘。
+     */
+    addBindingToDraft(draft, { channel, accountId = DEFAULT_ACCOUNT_ID, userId, label = '', origin = 'paired' } = {}) {
+      if (draft === null || typeof draft !== 'object' || Array.isArray(draft)) {
+        return { ok: false, reason: 'storage-failed' }
+      }
+      const table = normalizeBindings(draft[KEY_BINDINGS] ?? {})
+      const result = addBindingToTable(table, { channel, accountId, userId, label, origin })
+      if (result.ok !== true) return result
+      draft[KEY_BINDINGS] = table
+      return result
+    },
+
+    /** 移除绑定；末位 owner 不可删（守卫在调用方 admin/命令层，这里只做数据操作）。 */
+    removeBinding(channel, userId, accountId = undefined) {
+      const table = readBindings()
+      const key = keyFor(channel, String(userId ?? ''), accountId)
+      if (key === null) return { ok: false, reason: 'invalid-account' }
+      if (table[key] === undefined) return { ok: false, reason: 'not-found' }
+      delete table[key]
+      if (writeBindings(table) !== true) return { ok: false, reason: 'storage-failed' }
+      return { ok: true }
+    },
+
+    /** 改 label/role（末位 owner 降级守卫由调用方做）。 */
+    updateBinding(channel, userId, diff = {}, accountId = undefined) {
+      const table = readBindings()
+      const key = keyFor(channel, String(userId ?? ''), accountId)
+      if (key === null) return { ok: false, reason: 'invalid-account' }
+      const record = table[key]
+      if (record === undefined) return { ok: false, reason: 'not-found' }
+      if (typeof diff.label === 'string') record.label = diff.label.slice(0, 64)
+      if (VALID_ROLES.has(diff.role)) record.role = diff.role
+      table[key] = record
+      if (writeBindings(table) !== true) return { ok: false, reason: 'storage-failed' }
+      return { ok: true, record }
+    },
+
+    // ———————— 待确认绑定（学习键汇流，v0.7 计划书 §3.6） ————————
+
+    /** 记录待确认身份（飞书扫码 openId / wxpusher 订阅 uid）。幂等：已存在刷新 at。 */
+    addPending({ channel, accountId = DEFAULT_ACCOUNT_ID, userId, origin = 'learned', extra = {} }) {
+      if (!VALID_CHANNELS.has(channel)) return { ok: false, reason: 'invalid-channel' }
+      const normalizedAccountId = normalizeAccountId(accountId)
+      if (normalizedAccountId === null) return { ok: false, reason: 'invalid-account' }
+      const uid = String(userId ?? '').trim()
+      if (uid === '' || uid.length > 128) return { ok: false, reason: 'invalid-user' }
+      if (uid.includes(':')) {
+        warn(`拒绝含冒号的 userId 待确认绑定（复合键截断风险）：${channel}:${uid.slice(0, 32)}`)
+        return { ok: false, reason: 'invalid-user' }
+      }
+      const table = readBindings()
+      const binding = keyFor(channel, uid, normalizedAccountId)
+      if (binding === null) return { ok: false, reason: 'invalid-account' }
+      if (table[binding] !== undefined) return { ok: false, reason: 'already-bound' }
+      const pending = readPending()
+      const at = Date.now()
+      const key = keyFor(channel, uid, normalizedAccountId)
+      pending[key] = { channel, userId: uid, origin, at, extra }
+      if (normalizedAccountId !== DEFAULT_ACCOUNT_ID) pending[key].accountId = normalizedAccountId
+      const keys = Object.keys(pending)
+      if (keys.length > PENDING_MAX) {
+        keys.sort((a, b) => (pending[a]?.at ?? 0) - (pending[b]?.at ?? 0))
+        for (const stale of keys.slice(0, keys.length - PENDING_MAX)) delete pending[stale]
+      }
+      if (store !== null && setDurable(store, KEY_PENDING, pending) !== true) {
+        return { ok: false, reason: 'storage-failed' }
+      }
+      return { ok: true }
+    },
+
+    listPending() {
+      return Object.values(readPending())
+    },
+
+    /** 确认待确认绑定 → 转正为正式成员。 */
+    confirmPending(channel, userId, accountId = undefined) {
+      if (store === null) return { ok: false, reason: 'not-found' }
+      // 遗留第三方/mock store 没有跨键 transact：保留兼容路径；正式 createStore
+      // 始终走下面的单事务路径，避免真实状态出现 pending/binding 半提交。
+      if (typeof store.transact !== 'function') {
+        const pending = readPending()
+        const key = keyFor(channel, String(userId ?? ''), accountId)
+        if (key === null) return { ok: false, reason: 'invalid-account' }
+        const entry = pending[key]
+        if (entry === undefined) return { ok: false, reason: 'not-found' }
+        const bindings = readBindings()
+        if (bindings[key] !== undefined) return { ok: false, reason: 'already-bound' }
+        const added = addBindingToTable(bindings, { channel, accountId: entry.accountId, userId: entry.userId, origin: 'confirmed' })
+        if (added.ok !== true) return added
+        delete pending[key]
+        if (setDurable(store, KEY_PENDING, pending) !== true) return { ok: false, reason: 'storage-failed' }
+        if (setDurable(store, KEY_BINDINGS, bindings) !== true) return { ok: false, reason: 'storage-failed' }
+        return added
+      }
+      const outcome = { ok: false, reason: 'not-found' }
+      const tx = transactDurable(store, (draft) => {
+        const pending = normalizePending(draft[KEY_PENDING] ?? {}).out
+        const bindings = normalizeBindings(draft[KEY_BINDINGS] ?? {})
+        const key = keyFor(channel, String(userId ?? ''), accountId)
+        if (key === null) return false
+        const entry = pending[key]
+        if (entry === undefined) return false
+        if (bindings[key] !== undefined) {
+          outcome.reason = 'already-bound'
+          return false
+        }
+        delete pending[key]
+        const added = addBindingToTable(bindings, {
+          channel,
+          accountId: entry.accountId,
+          userId: entry.userId,
+          origin: 'confirmed',
+        })
+        if (added.ok !== true) {
+          outcome.reason = added.reason
+          return false
+        }
+        draft[KEY_PENDING] = pending
+        draft[KEY_BINDINGS] = bindings
+        outcome.ok = true
+        outcome.record = added.record
+        return true
+      })
+      if (tx.committed !== true) return { ok: false, reason: 'storage-failed' }
+      return outcome
+    },
+
+    dismissPending(channel, userId, accountId = undefined) {
+      const pending = readPending()
+      const key = keyFor(channel, String(userId ?? ''), accountId)
+      if (key === null) return { ok: false, reason: 'invalid-account' }
+      if (pending[key] === undefined) return { ok: false, reason: 'not-found' }
+      delete pending[key]
+      if (store !== null && setDurable(store, KEY_PENDING, pending) !== true) {
+        return { ok: false, reason: 'storage-failed' }
+      }
+      return { ok: true }
+    },
+  }
+}
+
+/** 渠道合法性集合（commands/admin 层复用）。 */
+export const IDENTITY_CHANNELS = VALID_CHANNELS
