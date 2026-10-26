@@ -1,0 +1,11 @@
+# 本地真实配置与运行时数据 — 不入库
+config.yaml
+noti-gateway.db
+noti-gateway.db-*
+log/
+boot.log
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.log

@@ -1,0 +1,87 @@
+server:
+  host: 0.0.0.0
+  port: 10086          # 端口范围 0-65535；按需改成 10008 / 8080 等
+
+auth:
+  # 共享 Token。调用方式：
+  #   curl -H "Authorization: Bearer <token>" http://IP:10086/n/ci -d "构建失败"
+  #   curl "http://IP:10086/n/ci?token=<token>" -d "构建失败"
+  # WebSocket:   ws://IP:100086/ws?token=<token>
+  token: "change-me-please"
+  allow_query_token: true
+  # 可选：来源 IP 白名单（支持 CIDR）
+  ip_allow: []
+
+limits:
+  per_source_per_minute: 60
+  per_target_per_minute: 30
+  per_target_per_day: 1000
+
+dedup:
+  # 同 (source, level, title) 在窗口内只发一次，压掉告警风暴
+  enabled: true
+  window_seconds: 60
+
+dispatch:
+  sync_timeout: 5.0
+  poll_interval: 0.5
+  concurrency: 8
+  retry_base: 2.0
+  retry_max: 300.0
+  max_attempts: 5
+
+ingest:
+  # WebSocket 上行 / SSE 订阅的接入控制
+  max_ws_clients: 64        # 全局并发 WS 连接上限（0 = 不限）
+  max_ws_per_source: 8      # 同一 source 的 WS 连接上限（0 = 不限），超限关闭码 4429
+  ws_keepalive: 20.0        # 服务端心跳间隔秒：空闲超此时长发 {"type":"ping"}（0 = 关闭）
+  ws_send_timeout: 10.0     # 给单个 WS 客户端回包的超时秒，超时断开该客户端
+  sse_keepalive: 15.0       # SSE 注释心跳间隔秒
+  sse_buffer: 256           # 每个订阅者的队列长度，满则丢消息不阻塞网关
+
+qq:
+  app_id: ""
+  client_secret: ""
+  api_base: "https://api.bot.qq.com"
+
+targets:
+  # --- QQ 群机器人（发消息是纯 HTTP，不需要维持 WebSocket）---
+  - id: qq:default
+    type: qq
+    group_openid: "REPLACE_WITH_YOUR_GROUP_OPENID"   # 群场景
+    # user_openid: ""         # 单聊场景，二选一
+    # channel_id: ""          # 频道场景（官方要求 WS 在线）
+    msg_type: 0               # 0=文本 2=Markdown
+    # template: "{{ title }}\n{{ body }}"
+    rate_per_minute: 25
+
+  # --- 通用 Webhook（企微 / 钉钉 / 飞书 / TG / 任意 URL）---
+  - id: hook:example
+    type: webhook
+    url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx"
+    method: POST
+    # 非 JSON 模板会以 {"msgtype":"text","text":{"content": ...}} 提交
+    # template: '{"msgtype":"text","text":{"content":"{{ title }}: {{ body }}"}'
+    rate_per_minute: 20
+
+  # --- 出站 WebSocket 连接池 ---
+  - id: ws:napcat
+    type: ws
+    url: "ws://127.0.0.1:3001"
+    pool: 2                     # 同时维持 2 条连接，round-robin 分配
+    ack_timeout: 5.0            # 0 表示不等回执（发完就算成功）
+    ping_interval: 30.0
+    reconnect_base: 1.0
+    reconnect_max: 60.0
+    template: '{"action":"send_group_msg","params":{"group_id":1,"message":"{{ title }}: {{ body }}"}}'
+    # ping_payload: '{"action":"ping","echo":"hb"}'   # OneBot 之类可配
+    # enabled: false
+
+routes:
+  # 按顺序匹配，第一条命中即生效；务必把 source:"*" 放最后兜底
+  - source: ci                 # 匹配 X-Source 头声明的来源
+    level: [error, warn]
+    targets: [qq:default]
+
+  - source: ["*"]              # 兜底
+    targets: [qq:default, hook:example]
