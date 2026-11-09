@@ -16,13 +16,14 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from .auth import AuthError, check_request, check_websocket
+from .chatdownload import ChatDownloader
 from .config import Config, load_config
 from .dailylog import DailyFileHandler
 from .dispatcher import Dispatcher, SubmitError
 from .hub import Hub
 from .ingest import build_notification, parse_http
 from .store import Store
-from .targets import build_targets
+from .targets import QQTokenCache, build_targets
 
 log = logging.getLogger("noti.server")
 
@@ -54,10 +55,18 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
         timeout=httpx.Timeout(15.0),
     )
-    reg = build_targets(cfg, client)
+    # QQ access_token 共享缓存：发送通道与 chatdownload 复用同一个机器人
+    tokens = QQTokenCache(cfg.qq, client)
+    reg = build_targets(cfg, client, tokens)
     store = Store(DB_PATH, cfg.dispatch)
     hub = Hub(buffer=cfg.ingest.sse_buffer)
     disp = Dispatcher(cfg, store, reg, hub=hub)
+    # 私聊消息归档（chatdownload）：复用同一 QQ 机器人，WS 收 C2C 消息落盘
+    cd = (
+        ChatDownloader(cfg.chatdownload, cfg.qq, tokens, client)
+        if cfg.chatdownload.enabled and cfg.qq.app_id and cfg.qq.client_secret
+        else None
+    )
 
     app.state.cfg = cfg
     app.state.client = client
@@ -65,6 +74,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.state.store = store
     app.state.dispatcher = disp
     app.state.hub = hub
+    app.state.chatdownload = cd
     # 入站长连接注册表：WS 按连接 id 记账，SSE 只计数
     app.state.ws_conns: dict[int, dict[str, Any]] = {}
     app.state.ws_seq = itertools.count(1)
@@ -78,6 +88,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if recovered:
             log.info("recovered %d inflight task(s) from previous run", recovered)
         await reg.start_all()
+        if cd is not None:
+            await cd.start()
         app.state.worker = asyncio.create_task(disp.run_worker(), name="noti-worker")
         log.info(
             "noti-gateway ready  port=%s  targets=%s",
@@ -94,6 +106,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 await asyncio.wait_for(worker, timeout=3)
         await disp.drain(timeout=10)
         await reg.close_all()
+        if cd is not None:
+            await cd.stop()
         await client.aclose()
         store.close()
         log.info("bye")
@@ -293,9 +307,13 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.get("/_health")
     async def health() -> JSONResponse:
-        return JSONResponse(
-            {"ok": True, "targets": {k: await v.health() for k, v in reg.targets.items()}}
-        )
+        out: dict[str, Any] = {
+            "ok": True,
+            "targets": {k: await v.health() for k, v in reg.targets.items()},
+        }
+        if cd is not None:
+            out["chatdownload"] = cd.health()
+        return JSONResponse(out)
 
     @app.get("/_stats")
     async def stats() -> JSONResponse:
@@ -309,6 +327,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     "ws": list(app.state.ws_conns.values()),
                     "sse_clients": app.state.sse["clients"],
                 },
+                "chatdownload": cd.info() if cd is not None else None,
             }
         )
 

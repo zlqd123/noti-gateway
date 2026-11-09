@@ -591,9 +591,12 @@ class Registry:
         return out
 
 
-def build_targets(cfg: Config, client: httpx.AsyncClient) -> Registry:
+def build_targets(
+    cfg: Config, client: httpx.AsyncClient, tokens: QQTokenCache | None = None
+) -> Registry:
     reg = Registry()
-    tokens = QQTokenCache(cfg.qq, client)
+    # tokens 可外部传入以共享同一份 access_token 缓存（如 chatdownload 复用同一机器人）
+    tokens = tokens or QQTokenCache(cfg.qq, client)
     for tc in cfg.targets:
         if not tc.enabled:
             continue

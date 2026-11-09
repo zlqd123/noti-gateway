@@ -3,6 +3,7 @@ config.yaml
 noti-gateway.db
 noti-gateway.db-*
 log/
+quest/
 boot.log
 __pycache__/
 *.pyc

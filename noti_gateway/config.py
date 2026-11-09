@@ -130,6 +130,16 @@ class RouteCfg:
 
 
 @dataclass
+class ChatdownloadCfg:
+    # 私聊消息归档（chatdownload）：复用 qq 段同一个机器人，WS 收 C2C 消息落盘
+    # 布局固定：chat.txt（文本）+ media/（图片与文件）+ events.jsonl（防丢流水）
+    enabled: bool = False
+    data_dir: str = "quest"  # 归档目录（相对运行目录）
+    target_users: list[str] = field(default_factory=list)  # user_openid 白名单；空 = 全部
+    download_concurrency: int = 2
+
+
+@dataclass
 class Config:
     server: ServerCfg
     auth: AuthCfg
@@ -140,6 +150,7 @@ class Config:
     targets: list[TargetCfg]
     routes: list[RouteCfg]
     ingest: IngestCfg = field(default_factory=IngestCfg)
+    chatdownload: ChatdownloadCfg = field(default_factory=ChatdownloadCfg)
     default_route: str = "default"
 
     def target(self, tid: str) -> TargetCfg | None:
@@ -194,6 +205,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         targets=targets,
         routes=routes,
         ingest=_dd(raw.get("ingest"), IngestCfg),
+        chatdownload=_dd(raw.get("chatdownload"), ChatdownloadCfg),
         default_route=raw.get("default_route", "default"),
     )
 

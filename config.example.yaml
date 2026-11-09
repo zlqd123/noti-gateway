@@ -85,3 +85,14 @@ routes:
 
   - source: ["*"]              # 兜底
     targets: [qq:default, hook:example]
+
+# 私聊消息归档（chatdownload）：复用 qq 段同一个机器人，WS 长连接收单聊消息实时落盘
+# 归档布局：<data_dir>/chat.txt（全部文本，一行一条）、media/（图片/文件/视频同一子目录）、
+#           events.jsonl（原始事件流水，先落盘后下载，防丢账本）、error.jsonl（下载失败记录）
+# 按需求裁剪：不补历史、不做去重、不回消息
+# 硬限制：QQ 开放平台无历史消息接口，离线期间消息永久丢失
+chatdownload:
+  enabled: false
+  data_dir: "quest"          # 归档目录（相对运行目录）
+  target_users: []           # user_openid 白名单；空 = 归档全部单聊
+  download_concurrency: 2    # 图片/文件并发下载数
