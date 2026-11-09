@@ -3,6 +3,8 @@
 统一通知网关。**一个端口（默认 `10086`）同时接收 curl / HTTP / Webhook / WebSocket 上行，并提供 SSE 事件订阅流**，支持多个客户端并发长连接，按配置扇出到 **QQ 官方机器人 / 任意 Webhook / 出站 WebSocket 连接池**。
 
 > 接入方式、连接协议细节、服务器部署与排错见 **[接入文档.md](接入文档.md)**。
+> 配套 DSH 插件（把 DSH 的通知 / 审批 / 提问接到本网关）：**[dsh-notifier-gate](https://github.com/zlqd123/dsh-notifier-gate)**。
+> 各客户端接入脚本与脱敏配置模板（ZCode / OpenCode / DSH / WorkBuddy）见 **[platform/](platform/)**。
 
 ## 为什么需要它
 
