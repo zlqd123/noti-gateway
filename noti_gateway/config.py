@@ -28,6 +28,14 @@ class AuthCfg:
     # 允许通过 ?token= 传（浏览器端 WebSocket 只能这样）
     allow_query_token: bool = True
     ip_allow: list[str] = field(default_factory=list)
+    # 密钥文件：实时读取，坏行静默忽略，随时增删改即生效（见 keyring.py 格式）
+    keys_file: str = ""
+    # HMAC 签名时间窗（秒），超出即拒绝，配合 nonce 防重放
+    hmac_window_sec: int = 300
+    # 命中密钥后是否强制 X-Source 与密钥 source 相符
+    strict_source: bool = False
+    # 是否强制 HMAC（true 时拒绝仅带 token 的旧调用）
+    require_hmac: bool = False
 
 
 @dataclass
@@ -209,7 +217,14 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         default_route=raw.get("default_route", "default"),
     )
 
-    if not cfg.auth.token:
+    # keys_file 相对路径按配置文件所在目录解析（部署时不依赖 cwd）
+    if cfg.auth.keys_file:
+        kp = Path(cfg.auth.keys_file)
+        if not kp.is_absolute():
+            kp = path.parent / kp
+        cfg.auth.keys_file = str(kp)
+
+    if not cfg.auth.token and not cfg.auth.keys_file:
         raise SystemExit("auth.token 未配置：出于安全考虑不提供无鉴权模式")
 
     ids = {t.id for t in targets}

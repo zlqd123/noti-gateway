@@ -164,7 +164,9 @@ def build_notification(
     )
 
 
-async def parse_http(req: Request, source: str, route: str) -> Notification:
-    raw = await _read_body(req)
+async def parse_http(req: Request, source: str, route: str, raw: bytes | None = None) -> Notification:
+    # raw 复用调用方已读出的原始字节（HMAC 需对原始体签名，避免二次消费 stream）
+    if raw is None:
+        raw = await _read_body(req)
     payload = _parse_body(raw, (req.headers.get("content-type") or "").lower())
     return build_notification(payload, source, route, dict(req.query_params))

@@ -3,14 +3,25 @@ server:
   port: 10086          # 端口范围 0-65535；按需改成 10008 / 8080 等
 
 auth:
-  # 共享 Token。调用方式：
+  # 共享 Token（旧服务兼容通道，永不硬破坏）。调用方式：
   #   curl -H "Authorization: Bearer <token>" http://IP:10086/n/ci -d "构建失败"
   #   curl "http://IP:10086/n/ci?token=<token>" -d "构建失败"
-  # WebSocket:   ws://IP:100086/ws?token=<token>
+  # WebSocket:   ws://IP:10086/ws?token=<token>
   token: "change-me-please"
   allow_query_token: true
   # 可选：来源 IP 白名单（支持 CIDR）
   ip_allow: []
+
+  # HMAC 多密钥文件（每次鉴权都实时读盘，坏行静默忽略，随时编辑随时启用）。
+  # 格式：  <id> <secret> [kind=hmac|token] [source=NAME] [enabled=0|1]
+  # 命中任一密钥即通过；HMAC 密钥的 source 以密钥为准（不采信请求头）。
+  # 签名（v1）：canonical = METHOD\nPATH\nTS\nNONCE\nBODY_SHA256_HEX
+  #   X-Noti-Signature: v1=<HMAC_SHA256(secret, canonical) hex>
+  #   配套头：X-Noti-Timestamp / X-Noti-Nonce / X-Noti-Content-SHA256 / X-Noti-Key-Id
+  keys_file: "keys.conf"
+  hmac_window_sec: 300     # 时间窗，配合 nonce 防重放
+  strict_source: false     # true 时强制 X-Source 与命中密钥的 source 相符
+  require_hmac: false      # true 时拒绝仅带 token 的旧调用（迁移完成后再打开）
 
 limits:
   per_source_per_minute: 60

@@ -21,7 +21,7 @@ from .config import Config, load_config
 from .dailylog import DailyFileHandler
 from .dispatcher import Dispatcher, SubmitError
 from .hub import Hub
-from .ingest import build_notification, parse_http
+from .ingest import MAX_BODY, build_notification, parse_http
 from .store import Store
 from .targets import QQTokenCache, build_targets
 
@@ -115,12 +115,20 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # ---------------- 入站：HTTP / curl / webhook ----------------
 
     async def _handle(req: Request, route: str) -> JSONResponse:
+        # 先单次读出原始请求体：HMAC 对原始字节签名，解析也复用它（stream 只能消费一次）
         try:
-            source = check_request(req, cfg.auth)
+            raw = await req.body()
+        except Exception:
+            raw = b""
+        if len(raw) > MAX_BODY:
+            # 超限直接拒（不能截断，否则 HMAC 对不上客户端签名的完整体）
+            return JSONResponse({"error": "payload too large"}, status_code=413)
+        try:
+            source = check_request(req, cfg.auth, raw)
         except AuthError as e:
             return JSONResponse({"error": e.message}, status_code=e.status)
 
-        n = await parse_http(req, source, route)
+        n = await parse_http(req, source, route, raw)
         wait = _truthy(req.query_params.get("wait", "")) or _truthy(req.headers.get("x-wait", ""))
         try:
             result = await disp.submit(n, wait=wait)
