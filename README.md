@@ -224,3 +224,30 @@ python tests/test_connections.py  # 多客户端并发/心跳/批量/_wait/SSE 2
 ```
 
 三个测试都自带 mock 服务，不需要真实 QQ 凭证、不需要联网。
+
+## 许可协议
+
+本仓库 **noti-gateway 本体**（`noti_gateway/`、`deploy/`、`tests/`、文档等）采用
+[GNU AGPL v3.0 or later](LICENSE) 授权：
+
+```
+Copyright (C) 2026 zlqd123
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+```
+
+即 **AGPL-3.0-or-later**。允许商用、修改、分发；但分发、或通过网络向用户提供本软件
+（含修改版）的服务时，必须向用户提供对应完整源码，且衍生作品同样按 AGPL 开源。
+
+例外（保留各自原许可证，与仓库根 LICENSE 并存）：
+
+- `platform/dsh/`：[`dsh-notifier-gate`](https://github.com/zlqd123/dsh-notifier-gate)
+  的接入副本，核心逻辑来自 [`dsh-notifier`](https://github.com/THEWOLFWALKER/dsh-notifier)
+  （MIT），整体维持 **MIT**——版权声明与许可全文见 `platform/dsh/LICENSE`、
+  `platform/dsh/THIRD_PARTY_NOTICES.md`。
+- `platform/opencode/`：节点检测架构复刻自
+  [opencode-notifier](https://github.com/mohak34/opencode-notifier)（MIT），
+  未移植任何代码，仅在此致谢。
