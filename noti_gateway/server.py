@@ -55,18 +55,19 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
         timeout=httpx.Timeout(15.0),
     )
-    # QQ access_token 共享缓存：发送通道与 chatdownload 复用同一个机器人
-    tokens = QQTokenCache(cfg.qq, client)
-    reg = build_targets(cfg, client, tokens)
+    # QQ access_token 缓存：每台机器人一份（build_targets 内建，注册进 reg.token_caches），
+    # chatdownload 与所绑定机器人共用同一份
+    reg = build_targets(cfg, client)
     store = Store(DB_PATH, cfg.dispatch)
     hub = Hub(buffer=cfg.ingest.sse_buffer)
     disp = Dispatcher(cfg, store, reg, hub=hub)
-    # 私聊消息归档（chatdownload）：复用同一 QQ 机器人，WS 收 C2C 消息落盘
-    cd = (
-        ChatDownloader(cfg.chatdownload, cfg.qq, tokens, client)
-        if cfg.chatdownload.enabled and cfg.qq.app_id and cfg.qq.client_secret
-        else None
-    )
+    # 私聊消息归档（chatdownload）：绑定一台机器人（bot 字段指定或自动选第一台），WS 收 C2C 消息落盘
+    cd = None
+    if cfg.chatdownload.enabled:
+        cd_bot_id, cd_qq = cfg.chatdownload_bot()
+        if cd_qq.app_id and cd_qq.client_secret:
+            cd_tokens = reg.token_caches.get(cd_bot_id, reg.token_caches[""])
+            cd = ChatDownloader(cfg.chatdownload, cd_qq, cd_tokens, client)
 
     app.state.cfg = cfg
     app.state.client = client

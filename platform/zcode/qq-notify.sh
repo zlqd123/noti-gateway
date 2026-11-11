@@ -14,8 +14,9 @@ CLIENT_SECRET="<同页 AppSecret，勿外泄>"
 USER_OPENID="<你的用户openid：私聊机器人一次，从 C2C_MESSAGE_CREATE 事件里取>"  # 用户 openid：私聊机器人一次，从 C2C_MESSAGE_CREATE 事件里取
 PING_URL="http://127.0.0.1:39527"  # qq-bot-listener.py 的健康检查地址
 WAIT_SECONDS=90                     # 最多等按钮点击的秒数，超时回退到 ZCode 本地确认框
-GATEWAY_URL="${GATEWAY_URL:-http://<网关IP>:10086}"        # 阿里云 noti-gateway；置空则任务完成通知直连 QQ
-GATEWAY_TOKEN="${GATEWAY_TOKEN:-<网关 auth.token>}"
+GATEWAY_URL="${GATEWAY_URL:-http://<网关地址>}"        # 阿里云 noti-gateway；置空则任务完成通知直连 QQ
+GATEWAY_KEY_ID="${GATEWAY_KEY_ID:-zcode}"                       # 网关 keys.conf 里的密钥代号
+GATEWAY_SECRET="${GATEWAY_SECRET:-<网关 keys.conf 里对应 hmac 行的 secret>}"  # HMAC 签名密钥（v1）
 # =========================================================
 
 TOKEN_URL="https://api.bot.qq.com/app/getAppAccessToken"
@@ -39,7 +40,7 @@ trap 'log "退出 code=$?"' EXIT
 
 # 代理免疫：本机装有 GHelper/clash 等代理，宿主进程可能给钩子注入代理变量；
 # 网关和 QQ API 均为国内直连地址，走代理反而超时（10s curl 上限 → 钩子失败）
-export NO_PROXY="${NO_PROXY:+$NO_PROXY,}<网关IP>,api.bot.qq.com,api.sgroup.qq.com,bots.qq.com"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}<网关地址>,api.bot.qq.com,api.sgroup.qq.com,bots.qq.com"
 export no_proxy="$NO_PROXY"
 
 if [[ "$APPID" == 请替换* || "$CLIENT_SECRET" == 请替换* || "$USER_OPENID" == 请替换* ]]; then
@@ -251,12 +252,25 @@ fi
 
 if [[ -n "$GATEWAY_URL" ]]; then
   # 中文必须写文件再发（命令行参数会被 Windows 编码转换成 ?）
-  printf '%s' "$msg" > "$HOME/.zcode/.qq-gateway-payload"
-  gw_code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST "${GATEWAY_URL}/n/zcode" \
-    -H "Authorization: Bearer ${GATEWAY_TOKEN}" \
-    -H "X-Source: zcode" \
-    -H "Content-Type: text/plain" \
-    --data-binary @"$HOME/.zcode/.qq-gateway-payload")
+  gw_payload="$HOME/.zcode/.qq-gateway-payload"
+  printf '%s' "$msg" > "$gw_payload"
+  gw_code=""
+  # HMAC 签名 v1：canonical = METHOD\nPATH\nTS\nNONCE\nBODY_SHA256_HEX（密钥按 UTF-8 字节参与 HMAC）
+  if [[ -n "$GATEWAY_SECRET" ]]; then
+    gw_ts=$(date +%s)
+    gw_nonce="${gw_ts}-$$-${RANDOM}${RANDOM}"
+    gw_sha=$(sha256sum "$gw_payload" | awk '{print $1}')
+    gw_sig=$(printf 'POST\n/n/zcode\n%s\n%s\n%s' "$gw_ts" "$gw_nonce" "$gw_sha" \
+      | openssl dgst -sha256 -hmac "$GATEWAY_SECRET" | awk '{print $NF}')
+    gw_code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST "${GATEWAY_URL}/n/zcode" \
+      -H "X-Noti-Signature: v1=${gw_sig}" \
+      -H "X-Noti-Timestamp: ${gw_ts}" \
+      -H "X-Noti-Nonce: ${gw_nonce}" \
+      -H "X-Noti-Content-SHA256: ${gw_sha}" \
+      -H "X-Noti-Key-Id: ${GATEWAY_KEY_ID}" \
+      -H "Content-Type: text/plain" \
+      --data-binary @"$gw_payload")
+  fi
   if [[ "$gw_code" == 20* ]]; then
     exit 0   # 202=已入队落盘，网关负责投递；200=同步成功
   fi

@@ -7,10 +7,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import sys
 import tempfile
+import time
+import urllib.parse
 from pathlib import Path
 
 import httpx
@@ -21,9 +26,37 @@ from fastapi import FastAPI, Request
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-TOKEN = "conn-test-token"
+# 测试专用密钥（写进临时 keys.conf；真实密钥绝不入库）
+KEY_ID = "conn-test"
+SECRET = "conn-test-secret-do-not-use-0000000000000000000000000000"
 PORT = 10097        # 网关
 QQ_PORT = 10098     # 假 QQ API
+
+
+def _sign(method: str, path: str, body: bytes) -> dict:
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(8)
+    body_hex = hashlib.sha256(body or b"").hexdigest()
+    canonical = "\n".join([method.upper(), path, ts, nonce, body_hex]).encode("utf-8")
+    sig = "v1=" + hmac.new(SECRET.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+    return {
+        "X-Noti-Signature": sig,
+        "X-Noti-Timestamp": ts,
+        "X-Noti-Nonce": nonce,
+        "X-Noti-Key-Id": KEY_ID,
+    }
+
+
+def _ws_url(source: str) -> str:
+    """入站 WS：签名头走查询串（浏览器式）；?source= 声明归属。"""
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(8)
+    body_hex = hashlib.sha256(b"").hexdigest()
+    canonical = "\n".join(["GET", "/ws", ts, nonce, body_hex]).encode("utf-8")
+    sig = "v1=" + hmac.new(SECRET.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+    q = urllib.parse.urlencode({"sig": sig, "ts": ts, "nonce": nonce,
+                                "key_id": KEY_ID, "source": source})
+    return f"ws://127.0.0.1:{PORT}/ws?{q}"
 
 
 def build_mock_qq() -> FastAPI:
@@ -48,9 +81,10 @@ def build_mock_qq() -> FastAPI:
     return app
 
 
-CONFIG = f"""
+def make_config(keys_path: str) -> str:
+    return f"""
 server: {{ host: 127.0.0.1, port: {PORT} }}
-auth: {{ token: "{TOKEN}" }}
+auth: {{ keys_file: "{keys_path}" }}
 limits: {{ per_source_per_minute: 120, per_target_per_minute: 60, per_target_per_day: 1000 }}
 dedup: {{ enabled: false }}
 dispatch: {{ poll_interval: 0.1, concurrency: 4 }}
@@ -81,8 +115,10 @@ async def wait_up(url: str, tries: int = 80) -> bool:
 
 async def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="noti-conn-"))
+    keys_path = tmp / "keys.conf"
+    keys_path.write_text(f"{KEY_ID} {SECRET} kind=hmac source=conn-test\n", encoding="utf-8")
     cfg_path = tmp / "config.yaml"
-    cfg_path.write_text(CONFIG, encoding="utf-8")
+    cfg_path.write_text(make_config(str(keys_path).replace("\\", "/")), encoding="utf-8")
     os.environ["NOTI_DB"] = str(tmp / "test.db")
 
     from noti_gateway.config import load_config
@@ -110,12 +146,10 @@ async def main() -> int:
         if not cond:
             failures.append(name)
 
-    H = {"Authorization": f"Bearer {TOKEN}"}
-
     async with httpx.AsyncClient(timeout=15) as c:
         print("\n[1] 多客户端并发互不串扰")
         async def client_session(source: str, title: str) -> tuple[str, str]:
-            async with websockets.connect(f"{wsbase}?token={TOKEN}&source={source}") as w:
+            async with websockets.connect(_ws_url(source)) as w:
                 await w.send(json.dumps({"title": title, "level": "info"}))
                 resp = json.loads(await asyncio.wait_for(w.recv(), timeout=5))
                 return source, resp.get("event_id", "")
@@ -131,19 +165,19 @@ async def main() -> int:
         check(a_id and a_id not in ids[1:], "回执没有串到别的客户端")
 
         print("\n[2] 连接注册表与统计")
-        async with websockets.connect(f"{wsbase}?token={TOKEN}&source=stat") as w:
-            st = (await c.get(f"{base}/_stats?token={TOKEN}")).json()
+        async with websockets.connect(_ws_url("stat")) as w:
+            st = (await c.get(f"{base}/_stats", headers=_sign("GET", "/_stats", b""))).json()
             check(st["ingest"]["ws_clients"] == 1, f"/_stats 可见 1 个在线 WS (实际 {st['ingest']['ws_clients']})")
             check(st["ingest"]["ws"][0]["source"] == "stat", "注册表记录了 source")
-        st = (await c.get(f"{base}/_stats?token={TOKEN}")).json()
+        st = (await c.get(f"{base}/_stats", headers=_sign("GET", "/_stats", b""))).json()
         check(st["ingest"]["ws_clients"] == 0, "断开后注册表清零")
 
         print("\n[3] 同 source 连接数上限")
-        w1 = await websockets.connect(f"{wsbase}?token={TOKEN}&source=dup")
-        w2 = await websockets.connect(f"{wsbase}?token={TOKEN}&source=dup")
+        w1 = await websockets.connect(_ws_url("dup"))
+        w2 = await websockets.connect(_ws_url("dup"))
         check(True, "同 source 第 2 条连接允许")
         try:
-            w3 = await websockets.connect(f"{wsbase}?token={TOKEN}&source=dup")
+            w3 = await websockets.connect(_ws_url("dup"))
             first = await asyncio.wait_for(w3.recv(), timeout=5)
             check("too many" in first, "第 3 条连接收到拒绝消息")
             try:
@@ -157,7 +191,7 @@ async def main() -> int:
         await w2.close()
 
         print("\n[4] 服务端空闲心跳")
-        async with websockets.connect(f"{wsbase}?token={TOKEN}&source=idle") as w:
+        async with websockets.connect(_ws_url("idle")) as w:
             got_ping = False
             for _ in range(6):
                 msg = json.loads(await asyncio.wait_for(w.recv(), timeout=1.5))
@@ -167,20 +201,20 @@ async def main() -> int:
             check(got_ping, "静默连接收到服务端 {type:ping}")
 
         print("\n[5] 客户端心跳与计数隔离")
-        st0 = (await c.get(f"{base}/_stats?token={TOKEN}")).json()["counters"]["received"]
-        async with websockets.connect(f"{wsbase}?token={TOKEN}&source=hb") as w:
+        st0 = (await c.get(f"{base}/_stats", headers=_sign("GET", "/_stats", b""))).json()["counters"]["received"]
+        async with websockets.connect(_ws_url("hb")) as w:
             await w.send("ping")
             pong = json.loads(await asyncio.wait_for(w.recv(), timeout=5))
             check(pong.get("type") == "pong", "文本 ping 收到 {type:pong}")
             await w.send(json.dumps({"type": "PING"}))
             pong2 = json.loads(await asyncio.wait_for(w.recv(), timeout=5))
             check(pong2.get("type") == "pong", "JSON ping 也按心跳处理")
-        st1 = (await c.get(f"{base}/_stats?token={TOKEN}")).json()["counters"]["received"]
+        st1 = (await c.get(f"{base}/_stats", headers=_sign("GET", "/_stats", b""))).json()["counters"]["received"]
         check(st1 == st0, f"心跳不产生通知 (received {st0} -> {st1})")
 
         print("\n[6] 批量提交")
         qs0 = (await c.get(f"http://127.0.0.1:{QQ_PORT}/_state")).json()["sent"]
-        async with websockets.connect(f"{wsbase}?token={TOKEN}&source=batch") as w:
+        async with websockets.connect(_ws_url("batch")) as w:
             await w.send(json.dumps([
                 {"title": "批量1"},
                 {"title": "批量2", "level": "warn"},
@@ -193,14 +227,14 @@ async def main() -> int:
         check(qs1 - qs0 == 2, f"QQ mock 收到 2 条 (实际 {qs1 - qs0})")
 
         print("\n[7] WS 单条同步 _wait")
-        async with websockets.connect(f"{wsbase}?token={TOKEN}&source=syncw") as w:
+        async with websockets.connect(_ws_url("syncw")) as w:
             await w.send(json.dumps({"title": "同步WS", "_wait": True}))
             resp = json.loads(await asyncio.wait_for(w.recv(), timeout=10))
             res = resp.get("results", {}).get("qq:default", {})
             check(resp.get("queued") is False and res.get("ok") is True, "单条消息可要求同步回执")
 
         print("\n[8] 二进制帧容错")
-        async with websockets.connect(f"{wsbase}?token={TOKEN}&source=bin") as w:
+        async with websockets.connect(_ws_url("bin")) as w:
             await w.send("二进制测试".encode("utf-8"))
             resp = json.loads(await asyncio.wait_for(w.recv(), timeout=5))
             check(resp.get("queued") is True, "二进制帧按 UTF-8 文本处理")
@@ -209,7 +243,8 @@ async def main() -> int:
         got_submitted = got_receipt = None
         async with c.stream(
             "GET", f"{base}/stream",
-            params={"token": TOKEN, "types": "submitted,receipt"},
+            params={"types": "submitted,receipt"},
+            headers=_sign("GET", "/stream", b""),
             timeout=httpx.Timeout(20),
         ) as resp_stream:
             check(resp_stream.status_code == 200, "SSE 建立 (200)")
@@ -222,9 +257,11 @@ async def main() -> int:
             deadline = asyncio.get_event_loop().time() + 10
             while asyncio.get_event_loop().time() < deadline:
                 if poster is None and connected:
+                    sse_body = json.dumps({"title": "SSE测试", "level": "info"}, ensure_ascii=False).encode("utf-8")
                     poster = asyncio.create_task(
-                        c.post(f"{base}/n/sse", headers={**H, "X-Source": "sse"},
-                               json={"title": "SSE测试", "level": "info"})
+                        c.post(f"{base}/n/sse", content=sse_body,
+                               headers={**_sign("POST", "/n/sse", sse_body),
+                                        "X-Source": "sse", "content-type": "application/json"})
                     )
                 try:
                     line = await asyncio.wait_for(lines.__anext__(), timeout=2)
@@ -249,7 +286,7 @@ async def main() -> int:
         check(got_submitted is not None, "SSE 收到 submitted 事件")
         check(got_receipt is not None, "SSE 收到匹配 event_id 的成功 receipt")
         await asyncio.sleep(0.3)
-        st = (await c.get(f"{base}/_stats?token={TOKEN}")).json()
+        st = (await c.get(f"{base}/_stats", headers=_sign("GET", "/_stats", b""))).json()
         check(st["ingest"]["sse_clients"] == 0, "SSE 断开后订阅计数归零")
 
     for s in servers:

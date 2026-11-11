@@ -563,6 +563,8 @@ class WSTarget:
 class Registry:
     def __init__(self) -> None:
         self.targets: dict[str, Any] = {}
+        # 每台机器人一份 access_token 缓存；key 为 bot id，"" = 旧式全局 qq 段
+        self.token_caches: dict[str, QQTokenCache] = {}
 
     def get(self, tid: str) -> Any | None:
         return self.targets.get(tid)
@@ -588,6 +590,11 @@ class Registry:
                 out[tid] = {"type": "qq", "scene": t.scene, "scene_id": t.scene_id}
             else:
                 out[tid] = {"type": type(t).__name__}
+            if getattr(t, "cfg", None) is not None:
+                if getattr(t.cfg, "remark", ""):
+                    out[tid]["remark"] = t.cfg.remark
+                if getattr(t.cfg, "bot", ""):
+                    out[tid]["bot"] = t.cfg.bot
         return out
 
 
@@ -595,13 +602,22 @@ def build_targets(
     cfg: Config, client: httpx.AsyncClient, tokens: QQTokenCache | None = None
 ) -> Registry:
     reg = Registry()
-    # tokens 可外部传入以共享同一份 access_token 缓存（如 chatdownload 复用同一机器人）
-    tokens = tokens or QQTokenCache(cfg.qq, client)
+    # tokens 可外部传入以共享同一份 access_token 缓存（如 chatdownload 复用同一机器人）；
+    # 未传入时按机器人各建一份，key 为 bot id（"" = 旧式全局 qq 段）
+    if tokens is not None:
+        reg.token_caches[""] = tokens
+    else:
+        reg.token_caches[""] = QQTokenCache(cfg.qq, client)
+    for b in cfg.bots:
+        reg.token_caches[b.id] = QQTokenCache(b.qq(), client)
+
     for tc in cfg.targets:
         if not tc.enabled:
             continue
         if tc.type == "qq":
-            reg.targets[tc.id] = QQBotTarget(tc, cfg.qq, tokens, client)
+            qq = cfg.qq_for(tc)
+            cache = reg.token_caches.get(tc.bot, reg.token_caches[""])
+            reg.targets[tc.id] = QQBotTarget(tc, qq, cache, client)
         elif tc.type == "webhook":
             if not tc.url:
                 raise SystemExit(f"webhook target {tc.id} 缺少 url")

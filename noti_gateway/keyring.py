@@ -2,11 +2,11 @@
 
 文件格式（UTF-8，一行一条，`#` 开头为注释，空行忽略）::
 
-    <id> <secret> [kind=hmac|token] [source=NAME] [enabled=0|1]
+    <id> <secret> [kind=hmac] [source=NAME] [enabled=0|1]
 
 - ``id``   ：密钥标识，``[A-Za-z0-9_-]{1,64}``
-- ``secret``：HMAC 密钥 / 明文 token（不可含空白）
-- ``kind`` ：``hmac``（默认，签名鉴权）或 ``token``（明文 Bearer 兼容旧接入）
+- ``secret``：HMAC 密钥（不可含空白）
+- ``kind`` ：``hmac``（缺省即 hmac；保留该键仅为兼容既有密钥表格式）
 - ``source``：归属来源；省略时取 ``id``。签名命中后 source 由本字段决定，不采信请求头。
 - ``enabled``：``0/false/no/off`` 关闭该条而不删除（随时启用/停用）
 
@@ -29,7 +29,7 @@ _MAX_FILE = 1024 * 1024  # 密钥文件 1MB 足够
 class Cred:
     id: str
     secret: str
-    kind: str = "hmac"  # hmac | token
+    kind: str = "hmac"
     source: str = ""  # 归属来源；空 = 用 id
     enabled: bool = True
 
@@ -43,7 +43,7 @@ def _parse_line(line: str) -> Cred | None:
     if not s or s.startswith("#"):
         return None
 
-    # 行内注释：token 以 # 开头即视为注释起点，其后全部忽略
+    # 行内注释：字段以 # 开头即视为注释起点，其后全部忽略
     toks: list[str] = []
     for t in s.split():
         if t.startswith("#"):
@@ -68,7 +68,7 @@ def _parse_line(line: str) -> Cred | None:
         if k not in _KNOWN_KEYS:
             return None
         if k == "kind":
-            if v not in ("hmac", "token"):
+            if v != "hmac":
                 return None
             kind = v
         elif k == "source":

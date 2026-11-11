@@ -32,6 +32,8 @@
   第 2 行  <正文>            <- 折叠成一行，超过 100 字符自动截断为 …
 """
 
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -53,7 +55,8 @@ LISTENER_DIR = os.environ.get(
 # 统一通知网关（noti-gateway）：纯文本/Markdown 推送优先走网关（统一配额/持久化/重试），
 # 失败自动回退直连 QQ。带按钮的交互卡片不走网关（网关不支持键盘按钮），始终直连。
 GATEWAY_URL = os.environ.get("QQ_GATEWAY_URL", "").rstrip("/")
-GATEWAY_TOKEN = os.environ.get("QQ_GATEWAY_TOKEN", "")
+GATEWAY_SECRET = os.environ.get("QQ_GATEWAY_SECRET", "")
+GATEWAY_KEY_ID = os.environ.get("QQ_GATEWAY_KEY_ID", "")
 GATEWAY_SOURCE = os.environ.get("QQ_GATEWAY_SOURCE", "workbuddy")
 
 _token = None
@@ -177,20 +180,31 @@ def _post(path, payload):
 
 # ---------- 纯文本 (msg_type 0) ----------
 def _via_gateway(content):
-    """把纯文本通知投递到统一网关。成功返回网关响应文本；未配置或失败返回 None，
+    """把纯文本通知经 HMAC v1 签名投递到统一网关。成功返回网关响应文本；未配置或失败返回 None，
     调用方回退直连 QQ。仅适用于发往网关既定目标（TARGET_OPENID）的消息。"""
-    if not GATEWAY_URL or not GATEWAY_TOKEN:
+    if not GATEWAY_URL or not GATEWAY_SECRET:
         return None
     lines = content.splitlines() or [""]
     title = lines[0].strip()[:100] or "(无标题)"
     body = "\n".join(lines[1:]).strip()
     payload = json.dumps({"title": title, "body": body},
                          ensure_ascii=False).encode("utf-8")
+    path = f"/n/{GATEWAY_SOURCE}"
+    ts = str(int(time.time()))
+    nonce = "%x-%x" % (random.getrandbits(48), int(time.time() * 1000))
+    body_hex = hashlib.sha256(payload).hexdigest()
+    canonical = "\n".join(["POST", path, ts, nonce, body_hex]).encode("utf-8")
+    sig = "v1=" + hmac.new(GATEWAY_SECRET.encode("utf-8"), canonical,
+                           hashlib.sha256).hexdigest()
     req = urllib.request.Request(
-        f"{GATEWAY_URL}/n/{GATEWAY_SOURCE}", data=payload, method="POST",
+        f"{GATEWAY_URL}{path}", data=payload, method="POST",
         headers={
+            "User-Agent": "noti-gateway-client/1.0",  # CDN 会拦 Python-urllib 默认 UA
             "Content-Type": "application/json",
-            "Authorization": "Bearer " + GATEWAY_TOKEN,
+            "X-Noti-Signature": sig,
+            "X-Noti-Timestamp": ts,
+            "X-Noti-Nonce": nonce,
+            "X-Noti-Key-Id": GATEWAY_KEY_ID or GATEWAY_SOURCE,
             "X-Source": GATEWAY_SOURCE,
         },
     )

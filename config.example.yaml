@@ -3,25 +3,25 @@ server:
   port: 10086          # 端口范围 0-65535；按需改成 10008 / 8080 等
 
 auth:
-  # 共享 Token（旧服务兼容通道，永不硬破坏）。调用方式：
-  #   curl -H "Authorization: Bearer <token>" http://IP:10086/n/ci -d "构建失败"
-  #   curl "http://IP:10086/n/ci?token=<token>" -d "构建失败"
-  # WebSocket:   ws://IP:10086/ws?token=<token>
-  token: "change-me-please"
-  allow_query_token: true
+  # 鉴权只支持 HMAC 多密钥（v1 签名）；keys_file 未配置会直接拒绝启动（无无鉴权模式）。
+  # 调用方式：POST /n/<source> 带签名头（客户端示例见 platform/ 各平台脚本）：
+  #   curl -X POST http://IP:10086/n/ci \
+  #     -H "X-Noti-Signature: v1=<hex>" -H "X-Noti-Timestamp: <unix秒>" \
+  #     -H "X-Noti-Nonce: <随机串>" -H "X-Noti-Key-Id: <密钥代号>" -d "构建失败"
+  # WebSocket /ws 握手同样要签名（canonical 用 GET /ws + 空体哈希）：
+  #   签名头可走握手 header，或查询参数 ?sig=&ts=&nonce=&key_id=
   # 可选：来源 IP 白名单（支持 CIDR）
   ip_allow: []
 
   # HMAC 多密钥文件（每次鉴权都实时读盘，坏行静默忽略，随时编辑随时启用）。
-  # 格式：  <id> <secret> [kind=hmac|token] [source=NAME] [enabled=0|1]
-  # 命中任一密钥即通过；HMAC 密钥的 source 以密钥为准（不采信请求头）。
+  # 格式：  <id> <secret> [kind=hmac] [source=NAME] [enabled=0|1]
+  # 命中任一密钥即通过；来源以命中密钥的 source 为准（X-Source 仅在 strict_source 下校验）。
   # 签名（v1）：canonical = METHOD\nPATH\nTS\nNONCE\nBODY_SHA256_HEX
   #   X-Noti-Signature: v1=<HMAC_SHA256(secret, canonical) hex>
   #   配套头：X-Noti-Timestamp / X-Noti-Nonce / X-Noti-Content-SHA256 / X-Noti-Key-Id
-  keys_file: "keys.conf"
+  keys_file: "keys.conf"   # 必填；相对路径按 config.yaml 所在目录解析
   hmac_window_sec: 300     # 时间窗，配合 nonce 防重放
   strict_source: false     # true 时强制 X-Source 与命中密钥的 source 相符
-  require_hmac: false      # true 时拒绝仅带 token 的旧调用（迁移完成后再打开）
 
 limits:
   per_source_per_minute: 60
@@ -54,6 +54,28 @@ qq:
   app_id: ""
   client_secret: ""
   api_base: "https://api.bot.qq.com"
+
+# --- 多机器人（bots）：每台机器人可挂多个目标，机器人/目标都可加中文备注 remark ---
+# bots[].targets 里的目标会自动平铺进全局目标表（bot 字段回填机器人 id），
+# 路由/分发不感知 bot 结构；目标 type 省略时默认 qq。
+# 旧式写法（上方 qq 段 + 下方 targets）依然兼容，两种可混用。
+bots:
+  - id: bot-a                     # 机器人 id，chatdownload.bot / 目标归属引用它
+    remark: "主力机器人"           # 中文备注（仅展示，出现在 /_stats）
+    app_id: "REPLACE_WITH_APP_ID"
+    client_secret: "REPLACE_WITH_CLIENT_SECRET"
+    api_base: "https://api.bot.qq.com"
+    targets:
+      - id: qq:default            # 目标 id 全局唯一
+        remark: "测试群"
+        group_openid: "REPLACE_WITH_YOUR_GROUP_OPENID"   # 群场景
+        # user_openid: ""         # 单聊场景，二选一
+        # channel_id: ""          # 频道场景（官方要求 WS 在线）
+        msg_type: 0               # 0=文本 2=Markdown
+        rate_per_minute: 25
+      - id: qq:me
+        remark: "手机单聊"
+        user_openid: "REPLACE_WITH_YOUR_USER_OPENID"
 
 targets:
   # --- QQ 群机器人（发消息是纯 HTTP，不需要维持 WebSocket）---
@@ -97,13 +119,14 @@ routes:
   - source: ["*"]              # 兜底
     targets: [qq:default, hook:example]
 
-# 私聊消息归档（chatdownload）：复用 qq 段同一个机器人，WS 长连接收单聊消息实时落盘
+# 私聊消息归档（chatdownload）：绑定一台机器人（bots[].id），WS 长连接收单聊消息实时落盘
 # 归档布局：<data_dir>/chat.txt（全部文本，一行一条）、media/（图片/文件/视频同一子目录）、
 #           events.jsonl（原始事件流水，先落盘后下载，防丢账本）、error.jsonl（下载失败记录）
 # 按需求裁剪：不补历史、不做去重、不回消息
 # 硬限制：QQ 开放平台无历史消息接口，离线期间消息永久丢失
 chatdownload:
   enabled: false
+  bot: ""                # 绑定 bots[].id；留空 = 第一个带凭据的 bot（无 bots 时用 qq 段）
   data_dir: "quest"          # 归档目录（相对运行目录）
   target_users: []           # user_openid 白名单；空 = 归档全部单聊
   download_concurrency: 2    # 图片/文件并发下载数

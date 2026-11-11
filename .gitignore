@@ -4,6 +4,9 @@ keys.conf
 keys.conf-*
 noti-gateway.db
 noti-gateway.db-*
+_e2e.db
+_e2e.db-*
+_e2e_config.yaml
 log/
 quest/
 boot.log

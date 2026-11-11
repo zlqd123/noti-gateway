@@ -4,8 +4,9 @@
       "command": "<pythonw.exe 或 python.exe 绝对路径>",
       "args": ["<本目录部署路径>/qq_notifier_mcp.py"],
       "env": {
-        "QQ_GATEWAY_URL": "http://<网关IP>:10086",
-        "QQ_GATEWAY_TOKEN": "<网关 auth.token>",
+        "QQ_GATEWAY_URL": "http://<网关地址>",
+        "QQ_GATEWAY_SECRET": "<网关 keys.conf 里对应 hmac 行的 secret>",
+        "QQ_GATEWAY_KEY_ID": "<密钥代号，缺省取 QQ_GATEWAY_SOURCE>",
         "QQ_GATEWAY_SOURCE": "workbuddy",
         "QQ_BOT_APPID": "<q.qq.com 开放平台 AppID>",
         "QQ_BOT_SECRET": "<同页 AppSecret>",

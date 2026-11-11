@@ -135,7 +135,7 @@ def build_notification(
         data = {"title": str(payload), "body": "", "fields": {}}
 
     # query 参数作为显式覆盖（?level=error&route=alerts 优先级最高）
-    query = {k: v for k, v in (query or {}).items() if k not in ("token", "wait")}
+    query = {k: v for k, v in (query or {}).items() if k not in ("sig", "ts", "nonce", "key_id", "wait")}
     if "level" in query:
         data["level"] = _norm_level(query["level"])
     if query.get("route"):

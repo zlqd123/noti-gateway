@@ -19,6 +19,7 @@
 import { readFileSync, appendFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
+import { createHash, createHmac } from "node:crypto"
 
 type QQConfig = {
   appId: string
@@ -45,7 +46,10 @@ type QQConfig = {
   cardInbound?: boolean
   /** 统一通知网关(noti-gateway)：纯文本推送优先走它(统一配额/持久化/重试)，失败回退直连；带按钮的卡片始终直连 */
   gatewayUrl?: string
-  gatewayToken?: string
+  /** HMAC 密钥（v1 签名，必填才走网关）；旧 token 通道已废弃 */
+  gatewaySecret?: string
+  /** HMAC 密钥 id（缺省取 gatewaySource） */
+  gatewayKeyId?: string
   gatewaySource?: string
   debug?: boolean
 }
@@ -199,21 +203,35 @@ async function postC2C(cfg: QQConfig, payload: C2CPayload): Promise<{ ok: boolea
   }
 }
 
-/** 经统一网关投递纯文本通知；成功返回 true，未配置/失败返回 false（调用方回退直连 QQ）。 */
+/** 经统一网关投递纯文本通知（HMAC v1 签名）；成功返回 true，未配置/失败返回 false（调用方回退直连 QQ）。 */
 async function sendViaGateway(cfg: QQConfig, content: string): Promise<boolean> {
   const base = (cfg.gatewayUrl ?? "").replace(/\/+$/, "")
-  if (!base || !cfg.gatewayToken) return false
+  if (!base || !cfg.gatewaySecret) return false
   const source = cfg.gatewaySource ?? "opencode"
   const lines = content.split("\n")
   const title = (lines[0] ?? "").trim().slice(0, 100) || "(无标题)"
   const body = lines.slice(1).join("\n").trim()
   try {
+    const raw = JSON.stringify({ title, body })
+    const path = `/n/${encodeURIComponent(source)}`
+    const ts = String(Math.floor(Date.now() / 1000))
+    const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36)
+    const bodyHex = createHash("sha256").update(raw, "utf8").digest("hex")
+    const sig = "v1=" + createHmac("sha256", cfg.gatewaySecret)
+      .update(["POST", path, ts, nonce, bodyHex].join("\n"), "utf8").digest("hex")
     const res = await fetchQQ(
-      `${base}/n/${encodeURIComponent(source)}`,
+      `${base}${path}`,
       {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${cfg.gatewayToken}`, "x-source": source },
-        body: JSON.stringify({ title, body }),
+        headers: {
+          "content-type": "application/json",
+          "x-noti-signature": sig,
+          "x-noti-timestamp": ts,
+          "x-noti-nonce": nonce,
+          "x-noti-key-id": cfg.gatewayKeyId ?? source,
+          "x-source": source,
+        },
+        body: raw,
       },
       cfg.proxy,
     )
@@ -499,7 +517,8 @@ export default {
     if (process.env.QQ_BOT_CLIENT_SECRET) opts.clientSecret = process.env.QQ_BOT_CLIENT_SECRET
     if (process.env.QQ_BOT_C2C_OPENID) opts.openid = process.env.QQ_BOT_C2C_OPENID
     if (process.env.QQ_GATEWAY_URL) opts.gatewayUrl = process.env.QQ_GATEWAY_URL
-    if (process.env.QQ_GATEWAY_TOKEN) opts.gatewayToken = process.env.QQ_GATEWAY_TOKEN
+    if (process.env.QQ_GATEWAY_SECRET) opts.gatewaySecret = process.env.QQ_GATEWAY_SECRET
+    if (process.env.QQ_GATEWAY_KEY_ID) opts.gatewayKeyId = process.env.QQ_GATEWAY_KEY_ID
     if (process.env.QQ_GATEWAY_SOURCE) opts.gatewaySource = process.env.QQ_GATEWAY_SOURCE
     const ev = { ...DEFAULTS.events, ...(fileOpts.events ?? {}), ...((ctx.options as any)?.events ?? {}) } as Required<
       NonNullable<QQConfig["events"]>

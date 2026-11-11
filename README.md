@@ -22,7 +22,7 @@
 ```bash
 cd noti-gateway
 pip install -r requirements.txt
-cp config.example.yaml config.yaml   # 然后填 auth.token / qq.app_id / qq.client_secret / group_openid
+cp config.example.yaml config.yaml   # 然后填 keys.conf 密钥 / qq.app_id / qq.client_secret / group_openid
 python -m noti_gateway.server
 ```
 
@@ -57,53 +57,76 @@ WantedBy=multi-user.target
 
 ## 调用方式
 
+### 鉴权：HMAC v1 签名（唯一方式，无 token 通道）
+
+每个请求对 `METHOD\nPATH\nTS\nNONCE\nBODY_SHA256_HEX`（canonical）做 HMAC-SHA256，密钥来自 `keys.conf` 的 `kind=hmac` 行，随请求带四个头：
+
+| 头 | 值 |
+|---|---|
+| `X-Noti-Signature` | `v1=<hex>`，`HMAC_SHA256(secret, canonical)` |
+| `X-Noti-Timestamp` | unix 秒，需在 `hmac_window_sec`（默认 300）内 |
+| `X-Noti-Nonce` | 随机串，窗口内不可重放 |
+| `X-Noti-Key-Id` | `keys.conf` 里的密钥代号 |
+
+来源归属以**命中密钥的 source** 为准（`X-Source` 仅在 `strict_source` 下校验）。bash 现算签名（openssl）：
+
+```bash
+KEY_ID=ci; SECRET='<keys.conf 里对应 secret>'; P=/n/ci
+TS=$(date +%s); NONCE=$RANDOM$RANDOM
+BODY_HEX=$(printf '构建失败' | sha256sum | awk '{print $1}')
+SIG=v1=$(printf 'POST\n%s\n%s\n%s\n%s' "$P" "$TS" "$NONCE" "$BODY_HEX" \
+  | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+curl -X POST "http://IP:10086$P" -H "X-Noti-Signature: $SIG" \
+     -H "X-Noti-Timestamp: $TS" -H "X-Noti-Nonce: $NONCE" \
+     -H "X-Noti-Key-Id: $KEY_ID" --data-binary '构建失败'
+```
+
+Node / Python / bash 的现成签名实现见 `platform/` 各平台脚本与 `tests/`。
+下文示例的 `${SIG_HEADERS}` 代指上表四个头（按各自 method/path/body 现算）。
+
 ### curl（最常见）
 
 ```bash
 # 异步：立刻返回 202，消息已落盘，网关后台慢慢发
-curl -X POST "http://IP:10086/n/ci" \
-     -H "Authorization: Bearer <token>" \
-     -H "X-Source: ci" \
+curl -X POST "http://IP:10086/n/ci" "${SIG_HEADERS[@]}" \
      -d "构建失败"
 
 # 同步：等平台真实回执，拿到每个 target 的成败
-curl -X POST "http://IP:10086/n/ci?wait=1" \
-     -H "Authorization: Bearer <token>" -H "X-Source: ci" \
+curl -X POST "http://IP:10086/n/ci?wait=1" "${SIG_HEADERS[@]}" \
      -d "构建失败"
 # => {"ok":false,"results":{"qq:default":{"ok":false,"code":100001,...}}}
-
-# token 走 query（不想改调用方脚本时）
-curl "http://IP:10086/n/ci?token=<token>&level=error&title=标题" -d "正文"
 ```
 
 ### JSON / 表单 / 纯文本都吃
 
 ```bash
 # JSON
-curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" -H "X-Source: ci" \
+curl -X POST "http://IP:10086/n/ci" "${SIG_HEADERS[@]}" \
      -H "Content-Type: application/json" \
      -d '{"level":"error","title":"MySQL 主库宕机","body":"10.0.0.5:3306","tags":["prod"]}'
 
 # 表单
-curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" \
+curl -X POST "http://IP:10086/n/ci" "${SIG_HEADERS[@]}" \
      -d "title=磁盘将满&body=/dev/sda1 91%"
 
 # 纯文本：第一行当标题，其余当正文
-curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" \
+curl -X POST "http://IP:10086/n/ci" "${SIG_HEADERS[@]}" \
      -H "Content-Type: text/plain" --data-binary $'备份完成\n耗时 12m'
 ```
 
 ### Webhook 风格
 
 ```bash
-curl -X POST "http://IP:10086/webhook/ci?token=<t>" \
-     -H "X-Source: ci" -d '{"title":"CI failed"}'
+curl -X POST "http://IP:10086/webhook/ci" "${SIG_HEADERS[@]}" \
+     -d '{"title":"CI failed"}'
 ```
 
 ### WebSocket 上行（多客户端并发）
 
 ```js
-const ws = new WebSocket("ws://IP:10086/ws?token=<t>&source=ci");
+// 握手也要签名：对 "GET\n/ws\nTS\nNONCE\n<空体 sha256>" 签名，
+// 四个头走握手 header，或等价查询参数 ?sig=&ts=&nonce=&key_id=
+const ws = new WebSocket("ws://IP:10086/ws?sig=v1=<hex>&ts=<ts>&nonce=<n>&key_id=ci&source=ci");
 ws.onopen = () => ws.send(JSON.stringify({ level: "error", title: "异常", body: "详情" }));
 ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","queued":true,...}
 ```
@@ -112,7 +135,7 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 
 ### SSE 订阅流
 
-`GET /stream?token=<t>` 以 `text/event-stream` 实时推送 `submitted / receipt / dead / suppressed` 事件，可用 `&source=` `&types=` 过滤，浏览器 `EventSource` 原生可用。
+带签名的 `GET /stream`（签名体为空）以 `text/event-stream` 实时推送 `submitted / receipt / dead / suppressed` 事件，可用 `&source=` `&types=` 过滤。
 
 ## 返回码含义
 
@@ -120,7 +143,7 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 |---|---|
 | `202` | **已入队**。注意：这只代表"记下来了"，不代表平台已收到 |
 | `200` | 同步模式（`wait=1`）拿到了各 target 的真实回执，看 `ok` 和 `results` |
-| `401` | token 缺失/错误 |
+| `401` | 签名缺失/错误/过期，或 nonce 重放 |
 | `403` | 来源 IP 不在白名单 |
 | `404` | 没有路由匹配到（检查 `routes` 是否漏了 `source: "*"` 兜底） |
 | `429` | 该来源超过 `per_source_per_minute` |
@@ -165,7 +188,7 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 见 `config.example.yaml`。要点：
 
 - `routes` **按顺序匹配，第一条命中即生效**，务必把 `source: "*"` 放最后兜底。
-- `source` 来自 **`X-Source` 头**（不是 body），配合共享 Token 用；不可信的调用方不要给它伪造 source 的机会，或用不同 Token 区分。
+- `source` 来自**命中密钥的 source 归属**（`keys.conf` 行上的 `source=`），按密钥区分调用方，不要共用密钥。
 - `dedup` 按 `(source, level, title)` 在窗口内只发一次。**QQ 配额下这不是优化项而是必需项**。
 - `limits.per_target_per_minute` 建议不超过 QQ 侧配额（未认证群 30/min）。
 - 每个 target 可单独 `rate_per_minute` 覆盖。
@@ -175,9 +198,9 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 | 接口 | 说明 |
 |---|---|
 | `GET /_health` | 各 target 连通性（**免鉴权**） |
-| `GET /_stats?token=` | 计数器 + 队列积压 + WS 连接状态 |
-| `GET /_receipt/{event_id}?token=` | 单条通知各 target 的投递回执 |
-| `GET /_failures?token=` | 死信列表（排查"到底丢没丢"） |
+| `GET /_stats`（带签名） | 计数器 + 队列积压 + WS 连接状态 |
+| `GET /_receipt/{event_id}`（带签名） | 单条通知各 target 的投递回执 |
+| `GET /_failures`（带签名） | 死信列表（排查"到底丢没丢"） |
 
 `/_stats` 返回的 `targets.<id>.connections` 会显示每条出站 WS 的 `state` / `sent` / `uptime_s`，可以确认连接池是否真的活着。
 
@@ -213,14 +236,16 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 - **单机单实例**设计。队列是本地 SQLite，多副本部署需要换 Redis。
 - 关闭时会排空队列（`TimeoutStopSec` 要给够时间），但排空超时后未发完的会留在 SQLite 里，下次启动自动恢复。
 - QQ **频道（子频道）** 场景官方要求机器人保持 WebSocket 在线。单聊收消息已由 chatdownload 实现（Gateway 收事件）；群聊 @机器人 消息、按钮交互、频道消息仍未接。
-- 只有共享 Token 的单点防护。多人/多机接入建议换成按来源的 Token 表 + HMAC 签名。
+- 鉴权为 HMAC 多密钥（`keys.conf`，`kind=hmac` 行），密钥即来源身份，按客户端分密钥即可隔离。
 
 ## 测试
 
 ```bash
-python tests/selftest.py          # 全链路 25 项：鉴权/异步/同步/WS池/去重/路由/格式/回执
-python tests/test_retry.py        # 重试与死信语义 9 项
-python tests/test_connections.py  # 多客户端并发/心跳/批量/_wait/SSE 22 项
+python tests/selftest.py          # 全链路 30 项：HMAC 鉴权/异步/同步/WS池/去重/路由/格式/回执
+python tests/test_auth.py         # 鉴权单元 22 项：HTTP/WS 签名、重放、strict_source、e2e
+python tests/test_retry.py        # 重试与死信语义 10 项
+python tests/test_connections.py  # 多客户端并发/心跳/批量/_wait/SSE 20 项
+python tests/test_config_bots.py  # 多机器人配置解析 19 项
 ```
 
 三个测试都自带 mock 服务，不需要真实 QQ 凭证、不需要联网。

@@ -1,8 +1,9 @@
 // gate-notify 插件配置 —— 放到 ~/.config/opencode/gate-notify.jsonc
 // 纯文本推送走网关（失败回退直连 QQ）；审批/表单卡片始终直连
 {
-  "gatewayUrl": "http://<网关IP>:10086",
-  "gatewayToken": "<网关 auth.token>",
+  "gatewayUrl": "http://<网关地址>",
+  "gatewaySecret": "<网关 keys.conf 里对应 hmac 行的 secret>",
+  "gatewayKeyId": "<密钥代号，缺省取 gatewaySource>",
   "gatewaySource": "opencode",
   "appId": "<q.qq.com 开放平台 AppID>",
   "clientSecret": "<同页 AppSecret>",

@@ -1,10 +1,10 @@
-"""鉴权测试：HMAC 多密钥 OR 验证 + 密钥文件实时解析 + 旧 token 双通道兼容。
+"""鉴权测试：HMAC 多密钥 OR 验证 + 密钥文件实时解析 + 无签名请求一律 401。
 
 覆盖最容易写错的点：
 1. keyring 坏行静默忽略、enabled=0 停用、注释忽略（随时编辑随时启用）
 2. HMAC 签名命中即通过，source 以命中的密钥为准（不采信请求头）
 3. 重放（同 nonce 二次使用）被拒；时间窗外被拒；换体/坏签名被拒
-4. 旧共享 token 与 kind=token 密钥仍被接受（永不硬破坏）
+4. 无签名（含旧 token 调用）一律 401；kind=token 行按坏行丢弃
 5. /n/ 走真实 handler：单次读 body 同时供签名与解析（stream 不被消费两次）
 
 运行：python tests/test_auth.py   或   pytest tests/test_auth.py
@@ -27,7 +27,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from noti_gateway.auth import AuthError, check_request  # noqa: E402
+from noti_gateway.auth import AuthError, check_request, check_websocket  # noqa: E402
 from noti_gateway.config import AuthCfg  # noqa: E402
 from noti_gateway.keyring import load_creds, parse_creds  # noqa: E402
 
@@ -94,17 +94,15 @@ def main() -> int:
     )
 
     cfg = AuthCfg(
-        token="shared-old-token",
         keys_file=str(keys_path),
         hmac_window_sec=300,
         strict_source=False,
-        require_hmac=False,
     )
 
     print("\n[1] keyring 实时解析")
     creds = load_creds(str(keys_path))
     ids = {c.id for c in creds}
-    check(ids == {"dsh", "3", "legacy"}, f"坏行/停用被丢弃，只剩有效项 (实际 {ids})")
+    check(ids == {"dsh", "3"}, f"坏行/停用/kind=token 被丢弃，只剩有效项 (实际 {ids})")
     dsh = next(c for c in creds if c.id == "dsh")
     check(dsh.kind == "hmac" and dsh.source == "dsh", "hmac 项解析出 kind/source")
     check(dsh.attribution == "dsh", "attribution 回退到 id/source")
@@ -162,29 +160,63 @@ def main() -> int:
     except AuthError as e:
         check(e.status == 401, f"错误密钥被拒 ({e.message})")
 
-    print("\n[4] 旧 token 双通道（永不硬破坏）")
+    print("\n[4] 无签名请求一律 401（token 通道已删除）")
     try:
-        src = check_request(_req(headers={"Authorization": "Bearer shared-old-token",
-                                          "X-Source": "ci"}), cfg, b"")
-        check(src == "ci", f"config 共享 token 仍通过，source 取头 (实际 {src})")
+        check_request(_req(headers={"Authorization": "Bearer shared-old-token",
+                                    "X-Source": "ci"}), cfg, b"")
+        check(False, "Bearer 旧口令被拒")
     except AuthError as e:
-        check(False, f"共享 token 被拒: {e.message}")
+        check(e.status == 401, f"Bearer 旧口令被拒 ({e.message})")
     try:
-        src = check_request(_req(headers={"Authorization": "Bearer test-legacy-token-do-not-use",
-                                          "X-Source": "legacy"}), cfg, b"")
-        check(src == "legacy", "kind=token 密钥仍通过")
+        check_request(_req(query={"token": "test-legacy-token-do-not-use"}), cfg, b"")
+        check(False, "?token= 旧口令被拒")
     except AuthError as e:
-        check(False, f"kind=token 密钥被拒: {e.message}")
-    # require_hmac 时仅 token 被拒
-    strict_cfg = AuthCfg(token="shared-old-token", keys_file=str(keys_path), require_hmac=True)
+        check(e.status == 401, f"?token= 旧口令被拒 ({e.message})")
     try:
-        check_request(_req(headers={"Authorization": "Bearer shared-old-token"}), strict_cfg, b"")
-        check(False, "require_hmac 下仅 token 被拒")
+        check_request(_req(), cfg, b"")
+        check(False, "无凭据被拒")
     except AuthError as e:
-        check(e.status == 401, f"require_hmac 下仅 token 被拒 ({e.message})")
+        check(e.status == 401, f"无凭据被拒 ({e.message})")
 
-    print("\n[5] strict_source 强制请求头与密钥相符")
-    s_cfg = AuthCfg(token="", keys_file=str(keys_path), strict_source=True)
+    print("\n[5] WebSocket 握手鉴权（GET 空体签名）")
+
+    def _ws(headers=None, query=None):
+        h = {str(k).lower(): v for k, v in (headers or {}).items()}
+        return SimpleNamespace(
+            headers=h,
+            query_params=dict(query or {}),
+            client=SimpleNamespace(host="127.0.0.1"),
+            url=SimpleNamespace(path="/ws"),
+        )
+
+    wh = _hmac_headers(SECRET_DSH, method="GET", path="/ws", body=b"", nonce="ws-1", source="desk")
+    try:
+        src = check_websocket(_ws(headers=wh), cfg)
+        check(src == "desk", f"WS 请求头签名通过 (实际 {src})")
+    except AuthError as e:
+        check(False, f"WS 请求头签名被拒: {e.message}")
+    # 浏览器式：签名头走查询串
+    ts = str(int(time.time()))
+    sig = _sign(SECRET_DSH, "GET", "/ws", ts, "ws-2", b"")
+    try:
+        src = check_websocket(_ws(query={"sig": sig, "ts": ts, "nonce": "ws-2",
+                                         "key_id": "dsh", "source": "browser"}), cfg)
+        check(src == "browser", f"WS 查询串签名通过 (实际 {src})")
+    except AuthError as e:
+        check(False, f"WS 查询串签名被拒: {e.message}")
+    try:
+        check_websocket(_ws(query={"sig": sig, "ts": ts, "nonce": "ws-2"}), cfg)
+        check(False, "WS 同 nonce 重放被拒")
+    except AuthError as e:
+        check(e.status == 401 and "replay" in e.message, f"WS 同 nonce 重放被拒 ({e.message})")
+    try:
+        check_websocket(_ws(query={"token": "anything"}), cfg)
+        check(False, "WS 无签名被拒")
+    except AuthError as e:
+        check(e.status == 401, f"WS 无签名被拒 ({e.message})")
+
+    print("\n[6] strict_source 强制请求头与密钥相符")
+    s_cfg = AuthCfg(keys_file=str(keys_path), strict_source=True)
     try:
         check_request(_req(headers=_hmac_headers(SECRET_DSH, body=body, nonce="nE", source="WRONG")),
                       s_cfg, body)
@@ -198,8 +230,8 @@ def main() -> int:
     except AuthError as e:
         check(False, f"strict_source 相符却抛错: {e.message}")
 
-    # ---- e2e：走真实 handler，验证单次读 body + HMAC/旧 token 均被接受 ----
-    print("\n[6] e2e 真实 handler（单次读 body）")
+    # ---- e2e：走真实 handler，验证单次读 body + HMAC 通过、无签名一律 401 ----
+    print("\n[7] e2e 真实 handler（单次读 body）")
     rc = asyncio.run(_e2e(str(keys_path)))
     for ok, name in rc:
         check(ok, name)
@@ -223,7 +255,6 @@ async def _e2e(keys_path: str) -> list[tuple[bool, str]]:
     cfg_path.write_text(
         "server: { host: 127.0.0.1, port: 18099 }\n"
         "auth:\n"
-        "  token: \"e2e-old-token\"\n"
         f"  keys_file: \"{keys_path.replace(chr(92), '/') }\"\n"
         "  hmac_window_sec: 300\n"
         "limits: { per_source_per_minute: 600, per_target_per_minute: 600, per_target_per_day: 100000 }\n"
@@ -252,11 +283,11 @@ async def _e2e(keys_path: str) -> list[tuple[bool, str]]:
                           nonce="e2e-1", source="dsh")
         r = await c.post("/n/dsh", content=body, headers={**h, "content-type": "application/json"})
         out.append((r.status_code == 202, f"HMAC 签名 -> 202 (实际 {r.status_code})"))
-        # 旧 token 通过
+        # 无签名的旧 token 调用被拒
         r = await c.post("/n/ci", content=body,
                          headers={"Authorization": "Bearer e2e-old-token", "X-Source": "ci",
                                   "content-type": "application/json"})
-        out.append((r.status_code == 202, f"旧 token -> 202 (实际 {r.status_code})"))
+        out.append((r.status_code == 401, f"无签名旧调用 -> 401 (实际 {r.status_code})"))
         # 无凭据被拒
         r = await c.post("/n/dsh", content=body, headers={"content-type": "application/json"})
         out.append((r.status_code == 401, f"无凭据 -> 401 (实际 {r.status_code})"))

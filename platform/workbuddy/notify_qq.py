@@ -62,7 +62,7 @@ ENV_KEYS = (
     "QQ_BOT_APPID", "QQ_BOT_SECRET", "QQ_TARGET_OPENID",
     "QQ_BOT_API_BASE", "QQ_BOT_TOKEN_URL", "QQ_NOTIFY_DRY_RUN",
     # 统一网关(noti-gateway)：不补这三个，Hook 侧就会绕过网关直连 QQ
-    "QQ_GATEWAY_URL", "QQ_GATEWAY_TOKEN", "QQ_GATEWAY_SOURCE",
+    "QQ_GATEWAY_URL", "QQ_GATEWAY_SECRET", "QQ_GATEWAY_KEY_ID", "QQ_GATEWAY_SOURCE",
 )
 
 # 判断「代理在上一条消息里像是在问用户 / 等用户确认」的关键词

@@ -24,9 +24,6 @@ class ServerCfg:
 
 @dataclass
 class AuthCfg:
-    token: str = ""
-    # 允许通过 ?token= 传（浏览器端 WebSocket 只能这样）
-    allow_query_token: bool = True
     ip_allow: list[str] = field(default_factory=list)
     # 密钥文件：实时读取，坏行静默忽略，随时增删改即生效（见 keyring.py 格式）
     keys_file: str = ""
@@ -34,8 +31,6 @@ class AuthCfg:
     hmac_window_sec: int = 300
     # 命中密钥后是否强制 X-Source 与密钥 source 相符
     strict_source: bool = False
-    # 是否强制 HMAC（true 时拒绝仅带 token 的旧调用）
-    require_hmac: bool = False
 
 
 @dataclass
@@ -88,6 +83,10 @@ class QQCfg:
 class TargetCfg:
     id: str
     type: str
+    # 中文备注（仅展示用，出现在 /_stats 等处，不参与路由）
+    remark: str = ""
+    # 所属机器人 id（bots[].targets 展开时自动填；顶层 target 可写 bot: xxx 复用某机器人凭据）
+    bot: str = ""
     # qq
     group_openid: str = ""
     user_openid: str = ""
@@ -112,6 +111,26 @@ class TargetCfg:
 
     def limit(self, global_limit: int) -> int:
         return self.rate_per_minute if self.rate_per_minute is not None else global_limit
+
+
+@dataclass
+class BotCfg:
+    """一个发送机器人：一套 QQ 凭据 + 名下多个目标。
+
+    bots[].targets 里的目标会平铺进 Config.targets（bot 字段回填本机器人 id），
+    路由/分发逻辑不感知 bot 结构；每台机器人、每个目标都可配 remark 中文备注。
+    """
+
+    id: str
+    # 中文备注（仅展示用，不参与路由）
+    remark: str = ""
+    app_id: str = ""
+    client_secret: str = ""
+    api_base: str = "https://api.bot.qq.com"
+    targets: list[TargetCfg] = field(default_factory=list)
+
+    def qq(self) -> QQCfg:
+        return QQCfg(app_id=self.app_id, client_secret=self.client_secret, api_base=self.api_base)
 
 
 @dataclass
@@ -145,6 +164,8 @@ class ChatdownloadCfg:
     data_dir: str = "quest"  # 归档目录（相对运行目录）
     target_users: list[str] = field(default_factory=list)  # user_openid 白名单；空 = 全部
     download_concurrency: int = 2
+    # 绑定哪个机器人收消息（bots[].id）；留空 = 第一个带凭据的 bot，再无则回落旧式全局 qq 段
+    bot: str = ""
 
 
 @dataclass
@@ -160,12 +181,43 @@ class Config:
     ingest: IngestCfg = field(default_factory=IngestCfg)
     chatdownload: ChatdownloadCfg = field(default_factory=ChatdownloadCfg)
     default_route: str = "default"
+    # 多机器人：bots[].targets 已平铺进 targets，此处保留结构用于凭据解析/展示
+    bots: list[BotCfg] = field(default_factory=list)
 
     def target(self, tid: str) -> TargetCfg | None:
         for t in self.targets:
             if t.id == tid:
                 return t
         return None
+
+    def bot(self, bid: str) -> BotCfg | None:
+        for b in self.bots:
+            if b.id == bid:
+                return b
+        return None
+
+    def qq_for(self, tc: TargetCfg) -> QQCfg:
+        """目标绑定的机器人凭据：bot 指定的机器人优先，否则回落旧式全局 qq 段。"""
+        if tc.bot:
+            b = self.bot(tc.bot)
+            if b is not None:
+                return b.qq()
+        return self.qq
+
+    def chatdownload_bot(self) -> tuple[str, QQCfg]:
+        """chatdownload 绑定的机器人：bot 字段指定 > 第一个带凭据的 bot > 旧式全局 qq 段。
+
+        返回 (bot_id, QQCfg)；bot_id 为空表示旧式全局 qq 段。
+        """
+        if self.chatdownload.bot:
+            b = self.bot(self.chatdownload.bot)
+            if b is None:
+                raise SystemExit(f"chatdownload.bot 引用了不存在的 bot: {self.chatdownload.bot}")
+            return b.id, b.qq()
+        for b in self.bots:
+            if b.app_id and b.client_secret:
+                return b.id, b.qq()
+        return "", self.qq
 
 
 def _dd(d: dict[str, Any], cls):
@@ -194,10 +246,38 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
     targets = []
+    bots: list[BotCfg] = []
+    for b in raw.get("bots", []) or []:
+        if "id" not in b:
+            raise SystemExit(f"bot 缺少 id: {b}")
+        bot = BotCfg(
+            id=b["id"],
+            remark=b.get("remark", ""),
+            app_id=b.get("app_id", ""),
+            client_secret=b.get("client_secret", ""),
+            api_base=b.get("api_base") or "https://api.bot.qq.com",
+        )
+        for t in b.get("targets", []) or []:
+            if "id" not in t:
+                raise SystemExit(f"bot {bot.id} 的 target 缺少 id: {t}")
+            if "type" not in t:
+                t = {**t, "type": "qq"}  # bot 名下的目标默认 QQ 发送
+            tc = _dd(t, TargetCfg)
+            tc.bot = bot.id
+            bot.targets.append(tc)
+            targets.append(tc)
+        bots.append(bot)
+
     for t in raw.get("targets", []) or []:
         if "id" not in t or "type" not in t:
             raise SystemExit(f"target 缺少 id 或 type: {t}")
         targets.append(_dd(t, TargetCfg))
+
+    seen: set[str] = set()
+    for tc in targets:
+        if tc.id in seen:
+            raise SystemExit(f"target id 重复: {tc.id}")
+        seen.add(tc.id)
 
     routes = [ _dd(r, RouteCfg) for r in (raw.get("routes") or []) ]
     if not routes:
@@ -215,6 +295,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         ingest=_dd(raw.get("ingest"), IngestCfg),
         chatdownload=_dd(raw.get("chatdownload"), ChatdownloadCfg),
         default_route=raw.get("default_route", "default"),
+        bots=bots,
     )
 
     # keys_file 相对路径按配置文件所在目录解析（部署时不依赖 cwd）
@@ -224,10 +305,16 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
             kp = path.parent / kp
         cfg.auth.keys_file = str(kp)
 
-    if not cfg.auth.token and not cfg.auth.keys_file:
-        raise SystemExit("auth.token 未配置：出于安全考虑不提供无鉴权模式")
+    if not cfg.auth.keys_file:
+        raise SystemExit("auth.keys_file 未配置：出于安全考虑不提供无鉴权模式")
 
     ids = {t.id for t in targets}
+    bot_ids = {b.id for b in bots}
+    for t in targets:
+        if t.bot and t.bot not in bot_ids:
+            raise SystemExit(f"target {t.id} 引用了不存在的 bot: {t.bot}")
+    if cfg.chatdownload.bot and cfg.chatdownload.bot not in bot_ids:
+        raise SystemExit(f"chatdownload.bot 引用了不存在的 bot: {cfg.chatdownload.bot}")
     for r in routes:
         for tid in r.targets:
             if tid not in ids:

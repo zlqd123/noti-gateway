@@ -12,7 +12,7 @@
 | **OpenCode** | `opencode/index.ts` | `~/.config/opencode/plugins/gate-notify/index.ts` | 插件本体：任务完成/出错/提问文本通知走网关，审批卡片直连 + WS 监听按钮回调执行审批 |
 | | `opencode/config.example.jsonc` | `~/.config/opencode/gate-notify.jsonc` | 配置模板 |
 | | `opencode/probe-openid.mjs` `send-test.mjs` `README.md` | 同插件目录 | 辅助：探测 openid / 发送测试 |
-| **DSH** | `dsh/`（完整插件源码包） | 见 `dsh/README.md` | `dsh-notifier-gate`：在 dsh-notifier 基础上给 `qq-bot` 适配器加了网关模式（`gatewayUrl/gatewayToken/gatewaySource` 三个字段），通道配置在 profile 的 `cordis.patch.yml` |
+| **DSH** | `dsh/`（完整插件源码包） | 见 `dsh/README.md` | `dsh-notifier-gate`：在 dsh-notifier 基础上给 `qq-bot` 适配器加了网关模式（`gatewayUrl/gatewaySecret/gatewayKeyId/gatewaySource` 四个字段；旧 `gatewayToken` 通道已废弃），通道配置在 profile 的 `cordis.patch.yml` |
 | **WorkBuddy** | `workbuddy/qq_notifier_mcp.py` `notify_qq.py` | 自选目录（MCP args 指向） | MCP 服务 `gate-notify`：notify_me / notify_me_markdown 走网关，notify_me_card（提问卡片+等待点击）直连 |
 | | `workbuddy/mcp.example.json` | `~/.workbuddy/mcp.json` | MCP 注册模板，凭据全部走 env |
 
@@ -20,7 +20,7 @@
 
 - `<q.qq.com 开放平台 AppID / AppSecret>`：[q.qq.com](https://q.qq.com) → 机器人开发设置
 - `<你的用户 openid>`：私聊机器人一次，从 `C2C_MESSAGE_CREATE` 事件里取（`opencode/probe-openid.mjs` 可辅助）
-- `<网关IP>:<端口>` 与 `<网关 auth.token>`：本网关服务端的 `config.yaml`
+- 网关地址与鉴权（HMAC 密钥，`keys.conf` 的 `kind=hmac` 行）：本网关服务端的 `config.yaml` / `keys.conf`；模板默认地址 `http://<网关地址>` 可按需替换
 - ZCode 钩子的 `<bash.exe 绝对路径>`：Windows 下钩子运行器要求可执行文件绝对路径（如 Git Bash 的 `D:/Git/bin/bash.exe`）
 
 ## 隐私约定
