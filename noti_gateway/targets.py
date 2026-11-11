@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import random
 import re
@@ -166,7 +168,234 @@ class QQBotTarget:
             return {"msg_type": 2, "markdown": text}
         return {"msg_type": 0, "content": text}
 
-    async def send(self, n: Notification) -> SendResult:
+    # ---------------- 富媒体（图片 / 文件） ----------------
+    # 上传恒走分片通道：upload_prepare(三哈希) -> 逐片 PUT -> 逐片 upload_part_finish
+    #   -> files 合并拿 file_info（契约抄自实测可用的 sd_media.py）。
+    # 坑位备忘：upload_prepare 必须带全 md5/sha1/md5_10m 三个哈希；
+    #   PUT 必须带 Content-Type，否则图能发出去但不渲染；
+    #   /files 简单表单上传在 api.bot.qq.com 稳定 40093007（见 _upload_chunked 注释）。
+
+    def _media_base(self) -> str:
+        base = self.tokens.qq.api_base.rstrip("/")
+        if self.scene == "group":
+            return f"{base}/v2/groups/{self.scene_id}"
+        if self.scene == "c2c":
+            return f"{base}/v2/users/{self.scene_id}"
+        return f"{base}/channels/{self.scene_id}"
+
+    def _resolve_media(self, media: dict | None) -> tuple[bytes, str, str]:
+        """内联 b64 或 /u/* ref -> (字节, 文件名, mime)。"""
+        if not media:
+            raise ValueError("空媒体")
+        if media.get("ref"):
+            from .uploads import get as get_store
+
+            data, meta = get_store().load(str(media["ref"]))
+            return (
+                data,
+                str(meta.get("name") or "file.bin"),
+                str(meta.get("mime") or "application/octet-stream"),
+            )
+        b64 = media.get("b64")
+        if not isinstance(b64, str) or not b64:
+            raise ValueError("媒体缺 b64/ref")
+        data = base64.b64decode(b64)
+        return (
+            data,
+            str(media.get("name") or "image.jpg"),
+            str(media.get("mime") or "image/jpeg"),
+        )
+
+    def _upload_result(self, r: httpx.Response, how: str) -> tuple[str | None, SendResult | None]:
+        """上传响应统一判定：返回 (file_info, None) 或 (None, SendResult)。401 交给调用方刷 token。"""
+        if r.status_code == 401:
+            return None, fail(self.id, 401, "token expired", retryable=True)
+        if r.status_code == 429 or r.status_code >= 500:
+            return None, fail(
+                self.id, r.status_code, f"upload({how}) http {r.status_code}: {r.text[:200]}", retryable=True
+            )
+        if r.status_code >= 400:
+            return None, fail(
+                self.id, r.status_code, f"upload({how}) http {r.status_code}: {r.text[:200]}", retryable=False
+            )
+        try:
+            body = r.json()
+        except Exception:
+            return None, fail(self.id, r.status_code, f"upload({how}) non-json: {r.text[:200]}", retryable=False)
+        code = int(body.get("code") or 0) if isinstance(body, dict) else -1
+        if code == 0 and isinstance(body, dict) and body.get("file_info"):
+            return str(body["file_info"]), None
+        return None, fail(
+            self.id, code, f"upload({how}) failed: {str(body)[:200]}", retryable=code in QQ_RETRYABLE_CODES
+        )
+
+    async def _upload_chunked(
+        self, token: str, data: bytes, name: str, mime: str, file_type: int
+    ) -> tuple[str | None, SendResult | None]:
+        """分片通道是 QQ 富媒体上传的唯一可用路径（恒走，不论大小）：
+        实测（2026-11-11）/files 简单表单上传在 api.bot.qq.com 稳定报
+        40093007 富媒体文件下载失败（多组字段变体均失败），而
+        upload_prepare(三哈希) -> PUT -> upload_part_finish -> files 合并
+        全程可用；小文件由服务端合成单片即可。"""
+        headers = {"Authorization": f"QQBot {token}"}
+        block_default = 10 * 1024 * 1024
+        try:
+            r = await self.tokens.client.post(
+                self._media_base() + "/upload_prepare",
+                headers=headers,
+                json={
+                    "file_type": file_type,
+                    "file_name": name,
+                    "file_size": len(data),
+                    "md5": hashlib.md5(data).hexdigest(),
+                    "sha1": hashlib.sha1(data).hexdigest(),
+                    "md5_10m": hashlib.md5(data[:block_default]).hexdigest(),
+                },
+                timeout=max(self.cfg.timeout, 30.0),
+            )
+        except Exception as e:
+            return None, fail(self.id, 0, f"prepare failed: {e!r}", retryable=True)
+        if r.status_code >= 400:
+            return None, fail(
+                self.id,
+                r.status_code,
+                f"prepare http {r.status_code}: {r.text[:200]}",
+                retryable=r.status_code == 429 or r.status_code >= 500,
+            )
+        try:
+            prep = r.json()
+            upload_id = prep["upload_id"]
+            parts = prep.get("parts") or []
+            block = int(prep.get("block_size") or len(data))
+        except Exception as e:
+            return None, fail(self.id, 0, f"prepare 解析失败: {e!r}", retryable=False)
+        if not parts:
+            return None, fail(self.id, 0, f"prepare 未返回分片: {str(prep)[:200]}", retryable=False)
+
+        for i, part in enumerate(parts):
+            chunk = data[i * block:(i + 1) * block]
+            try:
+                put = await self.tokens.client.put(
+                    part["presigned_url"],
+                    content=chunk,
+                    headers={"Content-Type": mime},
+                    timeout=max(self.cfg.timeout, 60.0),
+                )
+            except Exception as e:
+                return None, fail(self.id, 0, f"part{i} PUT failed: {e!r}", retryable=True)
+            if put.status_code >= 400:
+                return None, fail(
+                    self.id,
+                    put.status_code,
+                    f"part{i} PUT http {put.status_code}: {put.text[:120]}",
+                    retryable=put.status_code == 429 or put.status_code >= 500,
+                )
+            try:
+                fin = await self.tokens.client.post(
+                    self._media_base() + "/upload_part_finish",
+                    headers=headers,
+                    json={
+                        "upload_id": upload_id,
+                        "part_index": part["index"],
+                        "block_size": len(chunk),
+                        "md5": hashlib.md5(chunk).hexdigest(),
+                    },
+                    timeout=max(self.cfg.timeout, 30.0),
+                )
+            except Exception as e:
+                return None, fail(self.id, 0, f"part{i} finish failed: {e!r}", retryable=True)
+            if fin.status_code >= 400:
+                return None, fail(
+                    self.id,
+                    fin.status_code,
+                    f"part{i} finish http {fin.status_code}: {fin.text[:120]}",
+                    retryable=fin.status_code == 429 or fin.status_code >= 500,
+                )
+
+        try:
+            done_r = await self.tokens.client.post(
+                self._media_base() + "/files",
+                headers=headers,
+                json={"file_type": file_type, "file_name": name, "upload_id": upload_id, "srv_send_msg": False},
+                timeout=max(self.cfg.timeout, 30.0),
+            )
+        except Exception as e:
+            return None, fail(self.id, 0, f"merge failed: {e!r}", retryable=True)
+        return self._upload_result(done_r, f"chunked({len(parts)}片)")
+
+    async def _send_media(self, n: Notification, media: dict, kind: str) -> SendResult:
+        t0 = time.monotonic()
+
+        def done(r: SendResult) -> SendResult:
+            r.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return r
+
+        try:
+            data, name, mime = self._resolve_media(media)
+        except Exception as e:
+            return done(fail(self.id, 0, f"{kind} 解析失败: {e}", retryable=False))
+        if self.scene == "channel":
+            return done(fail(self.id, 0, "频道场景暂不支持富媒体", retryable=False))
+        if kind == "image" and mime not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+            return done(fail(self.id, 0, f"不支持的图片类型: {mime}", retryable=False))
+        file_type = 1 if kind == "image" else 4
+
+        for attempt in (1, 2):  # 第二次用于 401 后强制刷新 token 重试
+            try:
+                token = await self.tokens.get(force=attempt == 2)
+            except QQAuthError as e:
+                return done(fail(self.id, e.code, f"token error: {e.message}", retryable=False))
+            except Exception as e:  # 网络异常
+                return done(fail(self.id, 0, f"token request failed: {e!r}", retryable=True))
+
+            file_info, err = await self._upload_chunked(token, data, name, mime, file_type)
+            if err is not None:
+                if err.code == 401 and attempt == 1:
+                    self.tokens.invalidate()
+                    continue
+                return done(err)
+
+            try:
+                r = await self.tokens.client.post(
+                    self._path(),
+                    headers={"Authorization": f"QQBot {token}"},
+                    json={"msg_type": 7, "media": {"file_info": file_info}},
+                    timeout=self.cfg.timeout,
+                )
+            except Exception as e:
+                return done(fail(self.id, 0, f"media send failed: {e!r}", retryable=True))
+
+            if r.status_code == 401 and attempt == 1:
+                self.tokens.invalidate()
+                continue
+            if r.status_code == 429 or r.status_code >= 500:
+                return done(
+                    fail(self.id, r.status_code, f"http {r.status_code}: {r.text[:200]}", retryable=True)
+                )
+            if r.status_code >= 400:
+                return done(
+                    fail(self.id, r.status_code, f"http {r.status_code}: {r.text[:200]}", retryable=False)
+                )
+            try:
+                body = r.json()
+            except Exception:
+                return done(ok(self.id, "non-json response", 0))
+            if not isinstance(body, dict):
+                return done(ok(self.id, "unexpected body", 0))
+            code = int(body.get("code") or 0)
+            if code == 0:
+                return done(ok(self.id, f"media msg_id={body.get('id', '')} file_info={str(file_info)[:24]}"))
+            return done(
+                fail(
+                    self.id,
+                    code,
+                    body.get("message") or json.dumps(body, ensure_ascii=False)[:200],
+                    retryable=code in QQ_RETRYABLE_CODES,
+                )
+            )
+        return done(fail(self.id, 0, "unreachable"))
+
+    async def _send_text(self, n: Notification) -> SendResult:
         t0 = time.monotonic()
 
         def done(r: SendResult) -> SendResult:
@@ -225,6 +454,32 @@ class QQBotTarget:
                 )
             )
         return done(fail(self.id, 0, "unreachable"))
+
+    async def send(self, n: Notification) -> SendResult:
+        """文本 + 富媒体组合发送：image/file 各自一条 msg_type 7，文本按需一条。
+
+        纯媒体（无标题/正文/字段）不发多余文本消息。
+        """
+        results: list[tuple[str, SendResult]] = []
+        if n.image:
+            results.append(("image", await self._send_media(n, n.image, "image")))
+        if n.file:
+            results.append(("file", await self._send_media(n, n.file, "file")))
+        if (n.title or n.body or n.fields) or not results:
+            results.append(("text", await self._send_text(n)))
+        if len(results) == 1:
+            return results[0][1]
+
+        ok_all = all(r.ok for _, r in results)
+        detail = "; ".join(
+            f"{what}: {r.detail or ('ok' if r.ok else 'fail')}" for what, r in results
+        )
+        retryable = any(not r.ok and r.retryable for _, r in results)
+        code = next((r.code for _, r in results if not r.ok), 0)
+        elapsed = max((r.elapsed_ms for _, r in results), default=0)
+        if ok_all:
+            return ok(self.id, detail, elapsed)
+        return fail(self.id, code, detail, retryable, elapsed)
 
     async def health(self) -> bool:
         try:

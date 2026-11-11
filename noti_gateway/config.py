@@ -169,6 +169,15 @@ class ChatdownloadCfg:
 
 
 @dataclass
+class UploadsCfg:
+    # 分片上传收件（/u/*）：大文件先分片推给网关，通知里用 ref 引用
+    dir: str = ""                       # 存储目录；留空 = NOTI_DB 同级 uploads/
+    ttl: int = 86400                    # 上传件保留秒数，过期自动清理
+    chunk_size: int = 4 * 1024 * 1024   # 建议分片大小（字节）
+    max_size: int = 190 * 1024 * 1024   # 单件上限（QQ 分片通道实测 200MB，留余量）
+
+
+@dataclass
 class Config:
     server: ServerCfg
     auth: AuthCfg
@@ -180,6 +189,7 @@ class Config:
     routes: list[RouteCfg]
     ingest: IngestCfg = field(default_factory=IngestCfg)
     chatdownload: ChatdownloadCfg = field(default_factory=ChatdownloadCfg)
+    uploads: UploadsCfg = field(default_factory=UploadsCfg)
     default_route: str = "default"
     # 多机器人：bots[].targets 已平铺进 targets，此处保留结构用于凭据解析/展示
     bots: list[BotCfg] = field(default_factory=list)
@@ -294,6 +304,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         routes=routes,
         ingest=_dd(raw.get("ingest"), IngestCfg),
         chatdownload=_dd(raw.get("chatdownload"), ChatdownloadCfg),
+        uploads=_dd(raw.get("uploads"), UploadsCfg),
         default_route=raw.get("default_route", "default"),
         bots=bots,
     )

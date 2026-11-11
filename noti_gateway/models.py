@@ -20,6 +20,10 @@ class Notification:
     title: str = ""
     body: str = ""
     fields: dict[str, Any] = field(default_factory=dict)
+    # 富媒体：{"b64": ..., "mime": ..., "name": ...}（内联）
+    # 或 {"ref": <upload_id>, ...}（/u/* 分片上传后引用）
+    image: dict[str, Any] | None = None
+    file: dict[str, Any] | None = None
     route: str = "default"
     ts: float = field(default_factory=time.time)
     meta: dict[str, Any] = field(default_factory=dict)
@@ -27,7 +31,7 @@ class Notification:
     def __post_init__(self) -> None:
         if self.level not in LEVELS:
             self.level = "info"
-        if not self.title and not self.body:
+        if not self.title and not self.body and not self.image and not self.file:
             self.title = self.source
         if not self.title:
             self.title = self.body[:60]

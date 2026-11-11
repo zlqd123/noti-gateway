@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
@@ -9,13 +10,57 @@ from starlette.requests import Request
 
 from .models import Notification, LEVELS
 
-MAX_BODY = 256 * 1024
+# 内联 base64 图/文件（解码后 ≤10MB）单请求可容；更大走 /u/* 分片上传用 ref 引用
+MAX_BODY = 16 * 1024 * 1024
 
 TITLE_KEYS = ("title", "subject", "msg", "message", "text", "content", "summary", "event")
 BODY_KEYS = ("body", "content", "message", "desc", "description", "detail", "details", "text")
 LEVEL_KEYS = ("level", "severity", "status", "priority", "loglevel")
 ROUTE_KEYS = ("route", "channel", "topic")
 SOURCE_KEYS = ("source", "service", "app", "from", "sender")
+MEDIA_KEYS = ("image", "file")
+
+IMAGE_MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
+MAX_INLINE_BYTES = 10 * 1024 * 1024  # QQ 简单上传（/files file_data 内联）实测上限
+
+
+def _norm_media(v: Any, kind: str) -> dict | None:
+    """规范化 image/file 字段：{"b64", mime?, name?} 或 {"ref"}。非法抛 ValueError。"""
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise ValueError(f"{kind} 必须是对象 {{b64, mime?, name?}} 或 {{ref}}")
+    if v.get("ref") is not None:
+        ref = str(v.get("ref") or "").strip()
+        if not ref:
+            raise ValueError(f"{kind}.ref 不能为空")
+        return {"ref": ref}
+    b64 = v.get("b64")
+    if not isinstance(b64, str) or not b64.strip():
+        raise ValueError(f"{kind}.b64 必须是非空 base64 字符串（或改用 ref）")
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise ValueError(f"{kind}.b64 不是合法 base64") from None
+    if not raw:
+        raise ValueError(f"{kind}.b64 解码后为空")
+    if len(raw) > MAX_INLINE_BYTES:
+        raise ValueError(
+            f"{kind} 解码后 {len(raw)} 字节超过内联上限 {MAX_INLINE_BYTES}，请走 /u/* 分片上传再用 ref 引用"
+        )
+    mime = (str(v.get("mime") or "")).strip().lower()
+    if kind == "image":
+        mime = mime or "image/jpeg"
+        if mime not in IMAGE_MIME_EXT:
+            raise ValueError(f"image.mime 不支持: {mime}（支持 {', '.join(IMAGE_MIME_EXT)}）")
+        default_name = f"image{IMAGE_MIME_EXT[mime]}"
+    else:
+        mime = mime or "application/octet-stream"
+        default_name = "file.bin"
+    from .uploads import safe_name
+
+    name = safe_name(str(v.get("name") or ""), default_name)
+    return {"b64": b64, "mime": mime, "name": name}
 
 
 def _pick(d: dict, keys: tuple[str, ...], default: str = "") -> str:
@@ -114,12 +159,16 @@ def build_notification(
         data = {"title": title, "body": body, "fields": {}}
     elif isinstance(payload, dict):
         d = _unwrap(payload)
-        meta.setdefault("raw", payload)
+        # raw 只做排障用：剔除媒体大字段，避免 base64 在队列里存两份
+        meta.setdefault("raw", {k: v for k, v in payload.items() if k not in MEDIA_KEYS})
         title = _pick(d, TITLE_KEYS)
         body = _pick(d, BODY_KEYS)
         if title == body:
             body = ""
-        consumed = set(TITLE_KEYS) | set(BODY_KEYS) | set(LEVEL_KEYS) | set(ROUTE_KEYS) | set(SOURCE_KEYS)
+        consumed = (
+            set(TITLE_KEYS) | set(BODY_KEYS) | set(LEVEL_KEYS)
+            | set(ROUTE_KEYS) | set(SOURCE_KEYS) | set(MEDIA_KEYS)
+        )
         fields = {k: v for k, v in d.items() if k not in consumed and not isinstance(v, (dict, list))}
         for k, v in d.items():
             if k not in consumed and isinstance(v, (dict, list)):
@@ -130,9 +179,11 @@ def build_notification(
             "level": _norm_level(_pick(d, LEVEL_KEYS)),
             "route": _pick(d, ROUTE_KEYS),
             "fields": fields,
+            "image": _norm_media(d.get("image"), "image"),
+            "file": _norm_media(d.get("file"), "file"),
         }
     else:
-        data = {"title": str(payload), "body": "", "fields": {}}
+        data = {"title": str(payload), "body": "", "fields": {}, "image": None, "file": None}
 
     # query 参数作为显式覆盖（?level=error&route=alerts 优先级最高）
     query = {k: v for k, v in (query or {}).items() if k not in ("sig", "ts", "nonce", "key_id", "wait")}
@@ -159,6 +210,8 @@ def build_notification(
         title=data.get("title") or "",
         body=data.get("body") or "",
         fields=data.get("fields") or {},
+        image=data.get("image"),
+        file=data.get("file"),
         route=data.get("route") or route,
         meta=meta,
     )

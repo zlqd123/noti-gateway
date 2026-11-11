@@ -14,7 +14,9 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from pathlib import Path
 
+from . import uploads as upmod
 from .auth import AuthError, check_request, check_websocket
 from .chatdownload import ChatDownloader
 from .config import Config, load_config
@@ -59,6 +61,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # chatdownload 与所绑定机器人共用同一份
     reg = build_targets(cfg, client)
     store = Store(DB_PATH, cfg.dispatch)
+    # 分片上传收件：/u/* 的暂存区（默认 NOTI_DB 同级 uploads/，可用 uploads.dir 覆盖）
+    upmod.configure(cfg.uploads, base_dir=Path(DB_PATH).resolve().parent)
     hub = Hub(buffer=cfg.ingest.sse_buffer)
     disp = Dispatcher(cfg, store, reg, hub=hub)
     # 私聊消息归档（chatdownload）：绑定一台机器人（bot 字段指定或自动选第一台），WS 收 C2C 消息落盘
@@ -129,7 +133,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         except AuthError as e:
             return JSONResponse({"error": e.message}, status_code=e.status)
 
-        n = await parse_http(req, source, route, raw)
+        try:
+            n = await parse_http(req, source, route, raw)
+        except ValueError as e:
+            # image/file 字段校验失败等客户端错误
+            return JSONResponse({"error": str(e)}, status_code=400)
         wait = _truthy(req.query_params.get("wait", "")) or _truthy(req.headers.get("x-wait", ""))
         try:
             result = await disp.submit(n, wait=wait)
@@ -156,6 +164,63 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if req is None:
             return PlainTextResponse("ok", status_code=200)
         return await _handle(req, route)
+
+    # ---------------- 分片上传收件（/u/*） ----------------
+    # 大文件先分片推给网关，complete 后在 /n/{source} 的 image/file 里用 ref 引用。
+    # 每个请求独立 HMAC 签名（part 的签名体是原始分片字节）。
+
+    async def _u(req: Request, fn, max_body: int) -> JSONResponse:
+        try:
+            raw = await req.body()
+        except Exception:
+            raw = b""
+        if len(raw) > max_body:
+            return JSONResponse({"error": "payload too large"}, status_code=413)
+        try:
+            check_request(req, cfg.auth, raw)
+            result = await fn(raw)
+            return JSONResponse(result)
+        except AuthError as e:
+            return JSONResponse({"error": e.message}, status_code=e.status)
+        except upmod.UploadError as e:
+            return JSONResponse({"error": str(e)}, status_code=e.status)
+        except (json.JSONDecodeError, TypeError) as e:
+            return JSONResponse({"error": f"bad request: {e}"}, status_code=400)
+        except Exception:
+            log.exception("upload endpoint error")
+            return JSONResponse({"error": "internal error"}, status_code=500)
+
+    @app.post("/u/init")
+    async def u_init(req: Request) -> JSONResponse:
+        async def fn(raw: bytes) -> dict:
+            payload = json.loads(raw or b"{}")
+            if not isinstance(payload, dict):
+                raise upmod.UploadError("body 必须是 JSON 对象")
+            st = upmod.get()
+            return await asyncio.to_thread(
+                st.init,
+                str(payload.get("name") or ""),
+                str(payload.get("mime") or ""),
+                str(payload.get("kind") or "image"),
+                payload.get("size"),
+            )
+
+        return await _u(req, fn, max_body=64 * 1024)
+
+    @app.post("/u/{upload_id}/part/{index}")
+    async def u_part(upload_id: str, index: int, req: Request) -> JSONResponse:
+        async def fn(raw: bytes) -> dict:
+            return await asyncio.to_thread(upmod.get().put_part, upload_id, index, raw)
+
+        cap = upmod.get().chunk_size + 4096
+        return await _u(req, fn, max_body=cap)
+
+    @app.post("/u/{upload_id}/complete")
+    async def u_complete(upload_id: str, req: Request) -> JSONResponse:
+        async def fn(raw: bytes) -> dict:
+            return await asyncio.to_thread(upmod.get().complete, upload_id)
+
+        return await _u(req, fn, max_body=64 * 1024)
 
     # ---------------- 入站：WebSocket 上行（多客户端并发） ----------------
 
