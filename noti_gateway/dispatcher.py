@@ -1,4 +1,11 @@
-"""调度：路由扇出、限流、投递（同步/异步）、后台重试 worker。"""
+"""调度：路由扇出、限流、投递（同步/异步）、后台重试 worker。
+
+派发语义（2026-11-11 起）：
+- 双通道：富媒体（文件/图片，上传耗时长）与纯文本各走各的信号量与目标锁，
+  纯文本「到了就发」，绝不会被文件上传堵住；
+- 同一目标的富媒体严格按入队顺序 FIFO（1/3 -> 2/3 -> 3/3 不乱序）；
+- worker 按任务粒度异步派发，单个慢任务不再阻塞后续任务的领取与投递。
+"""
 
 from __future__ import annotations
 
@@ -35,7 +42,12 @@ class Dispatcher:
             for t in cfg.targets
         }
         self.deduper = Deduper(cfg.dedup.window_seconds) if cfg.dedup.enabled else None
-        self.sem = asyncio.Semaphore(cfg.dispatch.concurrency)
+        # 双通道并发上限：媒体与文本互不挤占，文本不会排队等文件上传
+        self.sem_media = asyncio.Semaphore(cfg.dispatch.concurrency)
+        self.sem_text = asyncio.Semaphore(cfg.dispatch.concurrency)
+        # 按目标的通道锁：同通道内 FIFO 保序（asyncio.Lock 等待者按到达顺序放行）
+        self._media_locks: dict[str, asyncio.Lock] = {}
+        self._text_locks: dict[str, asyncio.Lock] = {}
         self._closing = False
         self.counters = {
             "received": 0,
@@ -119,6 +131,10 @@ class Dispatcher:
 
     # ---------------- 投递 ----------------
 
+    @staticmethod
+    def _is_media(n: Notification) -> bool:
+        return bool(n.image or n.file)
+
     async def _deliver_one_target(self, n: Notification, tid: str) -> SendResult:
         target = self.reg.get(tid)
         if target is None:
@@ -128,7 +144,8 @@ class Dispatcher:
             allowed, reason = limiter.allow(tid)
             if not allowed:
                 return fail(tid, 0, f"throttled: {reason}", retryable=True)
-        async with self.sem:
+        sem = self.sem_media if self._is_media(n) else self.sem_text
+        async with sem:
             try:
                 return await target.send(n)
             except Exception as e:
@@ -153,8 +170,12 @@ class Dispatcher:
                 return
 
         n = Notification(**task.payload)
+        # 同通道按目标 FIFO：拿到任务的顺序就是加锁顺序（锁前无 await），顺序有保证
+        lane = self._media_locks if self._is_media(n) else self._text_locks
+        lock = lane.setdefault(task.target_id, asyncio.Lock())
         try:
-            result = await self._deliver_one_target(n, task.target_id)
+            async with lock:
+                result = await self._deliver_one_target(n, task.target_id)
         except Exception as e:  # 兜底，绝不让 worker 崩
             log.exception("deliver crashed")
             result = fail(task.target_id, 0, repr(e), retryable=True)
@@ -185,14 +206,27 @@ class Dispatcher:
         })
 
     async def run_worker(self) -> None:
-        batch = max(1, self.cfg.dispatch.concurrency)
+        # 每个任务独立异步投递（无批次栅栏）：慢文件只挡同通道后续文件，
+        # 不再挡任何文本通知的领取与发送
+        inflight: set[asyncio.Task] = set()
+        max_inflight = max(8, self.cfg.dispatch.concurrency * 4)
+
+        def _done(t: asyncio.Task) -> None:
+            inflight.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                log.error("handle_task crashed: %r", t.exception())
+
         while not self._closing:
             try:
-                tasks = await self.store.claim(batch)
+                room = max_inflight - len(inflight)
+                tasks = await self.store.claim(room) if room > 0 else []
                 if not tasks:
                     await asyncio.sleep(self.cfg.dispatch.poll_interval)
                     continue
-                await asyncio.gather(*(self._handle_task(t) for t in tasks))
+                for t in tasks:
+                    at = asyncio.create_task(self._handle_task(t))
+                    inflight.add(at)
+                    at.add_done_callback(_done)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
