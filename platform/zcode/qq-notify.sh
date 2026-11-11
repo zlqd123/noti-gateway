@@ -14,7 +14,7 @@ CLIENT_SECRET="<同页 AppSecret，勿外泄>"
 USER_OPENID="<你的用户openid：私聊机器人一次，从 C2C_MESSAGE_CREATE 事件里取>"  # 用户 openid：私聊机器人一次，从 C2C_MESSAGE_CREATE 事件里取
 PING_URL="http://127.0.0.1:39527"  # qq-bot-listener.py 的健康检查地址
 WAIT_SECONDS=90                     # 最多等按钮点击的秒数，超时回退到 ZCode 本地确认框
-GATEWAY_URL="${GATEWAY_URL:-http://<网关地址>}"        # 阿里云 noti-gateway；置空则任务完成通知直连 QQ
+GATEWAY_URL="${GATEWAY_URL:-http://<网关地址>}"        # noti-gateway 地址（按自己的部署填写）；置空则任务完成通知直连 QQ
 GATEWAY_KEY_ID="${GATEWAY_KEY_ID:-zcode}"                       # 网关 keys.conf 里的密钥代号
 GATEWAY_SECRET="${GATEWAY_SECRET:-<网关 keys.conf 里对应 hmac 行的 secret>}"  # HMAC 签名密钥（v1）
 # =========================================================
@@ -40,7 +40,7 @@ trap 'log "退出 code=$?"' EXIT
 
 # 代理免疫：本机装有 GHelper/clash 等代理，宿主进程可能给钩子注入代理变量；
 # 网关和 QQ API 均为国内直连地址，走代理反而超时（10s curl 上限 → 钩子失败）
-export NO_PROXY="${NO_PROXY:+$NO_PROXY,}<网关地址>,api.bot.qq.com,api.sgroup.qq.com,bots.qq.com"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}<网关域名>,api.bot.qq.com,api.sgroup.qq.com,bots.qq.com"
 export no_proxy="$NO_PROXY"
 
 if [[ "$APPID" == 请替换* || "$CLIENT_SECRET" == 请替换* || "$USER_OPENID" == 请替换* ]]; then

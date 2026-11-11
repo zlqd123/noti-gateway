@@ -20,7 +20,7 @@
 
 - `<q.qq.com 开放平台 AppID / AppSecret>`：[q.qq.com](https://q.qq.com) → 机器人开发设置
 - `<你的用户 openid>`：私聊机器人一次，从 `C2C_MESSAGE_CREATE` 事件里取（`opencode/probe-openid.mjs` 可辅助）
-- 网关地址与鉴权（HMAC 密钥，`keys.conf` 的 `kind=hmac` 行）：本网关服务端的 `config.yaml` / `keys.conf`；模板默认地址 `http://<网关地址>` 可按需替换
+- 网关地址与鉴权（HMAC 密钥，`keys.conf` 的 `kind=hmac` 行）：本网关服务端的 `config.yaml` / `keys.conf`；模板中网关地址以 `<网关地址>` 占位，请按自己的部署填写
 - ZCode 钩子的 `<bash.exe 绝对路径>`：Windows 下钩子运行器要求可执行文件绝对路径（如 Git Bash 的 `D:/Git/bin/bash.exe`）
 
 ## 隐私约定
