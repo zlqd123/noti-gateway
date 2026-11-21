@@ -91,6 +91,54 @@ def default_text(n: Notification) -> str:
 QQ_TOKEN_PATH = "/app/getAppAccessToken"
 QQ_RETRYABLE_CODES = {100001}  # Too many requests
 
+# 被动回复：带收到消息的 msg_id(+递增 msg_seq) 发送即不占主动消息配额。
+# 窗口/条数取保守值：收到后 4 分钟内、同一 msg_id 最多 5 条；超限自动降级主动消息。
+_PASSIVE_WINDOW = 240.0
+_PASSIVE_MAX_SEQ = 5
+_PASSIVE_SEQ: dict[str, tuple[float, int]] = {}  # msg_id -> (最后使用时刻, 已用 seq)
+
+
+def _passive_params(passive: dict | None) -> dict:
+    """根据 meta.passive 计算 msg_id/msg_seq 参数；窗口外/超条数返回 {}（转主动消息）。"""
+    if not passive or not passive.get("msg_id"):
+        return {}
+    msg_id = str(passive["msg_id"])
+    now = time.time()
+    for k in [k for k, (ts, _) in _PASSIVE_SEQ.items() if now - ts > _PASSIVE_WINDOW]:
+        _PASSIVE_SEQ.pop(k, None)
+    recv_ts = float(passive.get("recv_ts") or now)
+    if now - recv_ts > _PASSIVE_WINDOW:
+        return {}
+    ts_seq = _PASSIVE_SEQ.get(msg_id)
+    if ts_seq is None:
+        _PASSIVE_SEQ[msg_id] = (now, 1)
+        return {"msg_id": msg_id, "msg_seq": 1}
+    _, seq = ts_seq
+    if seq >= _PASSIVE_MAX_SEQ:
+        return {}
+    _PASSIVE_SEQ[msg_id] = (now, seq + 1)
+    return {"msg_id": msg_id, "msg_seq": seq + 1}
+
+
+# --------------------------------------------------------------------------
+# 出站观察者：webchat 等插件注册，记录 QQ 发出的消息（面板历史用）。
+# rec: {"scene", "scene_id", "kind", "text", "msg_id", "error"}
+# --------------------------------------------------------------------------
+def _fire_send_observers(rec: dict) -> None:
+    for fn in _send_observers:
+        try:
+            fn(rec)
+        except Exception:  # noqa: BLE001  # 观察者故障不得影响投递主流程
+            pass
+
+
+def register_send_observer(fn: Callable[[dict], None]) -> None:
+    """注册 QQ 出站观察者；fn(rec) 同步调用，调用方自行兜住异常影响面。"""
+    _send_observers.append(fn)
+
+
+_send_observers: list[Callable[[dict], None]] = []
+
 
 class QQTokenCache:
     """access_token 共享缓存。7200 秒有效，提前 5 分钟刷新。"""
@@ -325,9 +373,19 @@ class QQBotTarget:
 
     async def _send_media(self, n: Notification, media: dict, kind: str) -> SendResult:
         t0 = time.monotonic()
+        out = {"msg_id": "", "text": f"[{kind}] {media.get('name', '')}".strip()}
 
         def done(r: SendResult) -> SendResult:
             r.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            if self.scene in ("c2c", "group"):
+                _fire_send_observers({
+                    "scene": self.scene,
+                    "scene_id": self.scene_id,
+                    "kind": kind,
+                    "text": out["text"][:2000],
+                    "msg_id": out["msg_id"] if r.ok else "",
+                    "error": "" if r.ok else r.detail[:300],
+                })
             return r
 
         try:
@@ -356,10 +414,13 @@ class QQBotTarget:
                 return done(err)
 
             try:
+                # 被动回复：媒体消息同样支持带 msg_id/msg_seq（webchat 面板回复用）
+                media_payload = {"msg_type": 7, "media": {"file_info": file_info}}
+                media_payload.update(_passive_params((n.meta or {}).get("passive")))
                 r = await self.tokens.client.post(
                     self._path(),
                     headers={"Authorization": f"QQBot {token}"},
-                    json={"msg_type": 7, "media": {"file_info": file_info}},
+                    json=media_payload,
                     timeout=self.cfg.timeout,
                 )
             except Exception as e:
@@ -384,6 +445,7 @@ class QQBotTarget:
                 return done(ok(self.id, "unexpected body", 0))
             code = int(body.get("code") or 0)
             if code == 0:
+                out["msg_id"] = str(body.get("id", ""))
                 return done(ok(self.id, f"media msg_id={body.get('id', '')} file_info={str(file_info)[:24]}"))
             return done(
                 fail(
@@ -397,9 +459,19 @@ class QQBotTarget:
 
     async def _send_text(self, n: Notification) -> SendResult:
         t0 = time.monotonic()
+        out = {"msg_id": "", "text": ""}  # 出站观察者取值
 
         def done(r: SendResult) -> SendResult:
             r.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            if self.scene in ("c2c", "group"):
+                _fire_send_observers({
+                    "scene": self.scene,
+                    "scene_id": self.scene_id,
+                    "kind": "text",
+                    "text": out["text"][:2000],
+                    "msg_id": out["msg_id"] if r.ok else "",
+                    "error": "" if r.ok else r.detail[:300],
+                })
             return r
 
         for attempt in (1, 2):  # 第二次用于 401 后强制刷新 token 重试
@@ -411,10 +483,16 @@ class QQBotTarget:
                 return done(fail(self.id, 0, f"token request failed: {e!r}", retryable=True))
 
             try:
+                payload = self._payload(n)
+                out["text"] = str(payload.get("content") or payload.get("markdown") or "")
+                # 被动回复：meta.passive 带 msg_id 时附加 msg_id/msg_seq，不占主动配额
+                params = _passive_params((n.meta or {}).get("passive"))
+                if params:
+                    payload = {**payload, **params}
                 r = await self.tokens.client.post(
                     self._path(),
                     headers={"Authorization": f"QQBot {token}"},
-                    json=self._payload(n),
+                    json=payload,
                     timeout=self.cfg.timeout,
                 )
             except Exception as e:
@@ -444,6 +522,7 @@ class QQBotTarget:
             code = int(body.get("code") or 0)
             if code == 0:
                 msg_id = body.get("id", "")
+                out["msg_id"] = str(msg_id)
                 return done(ok(self.id, f"msg_id={msg_id}"))
             return done(
                 fail(

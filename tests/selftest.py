@@ -7,73 +7,36 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import os
-import secrets
 import sys
 import tempfile
-import time
-import urllib.parse
 from pathlib import Path
 
 import httpx
 import uvicorn
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-# 测试专用密钥（写进临时 keys.conf；真实密钥只存在于本地/服务器 keys.conf，绝不入库）
-KEYS: dict[str, tuple[str, str]] = {
-    "ci": ("selftest-ci", "selftest-ci-secret-do-not-use-0000000000000000000000"),
-    "other": ("selftest-other", "selftest-other-secret-do-not-use-000000000000000000"),
-}
+from _hmac import HmacClient, sig_query, sign_headers  # noqa: E402
+
+# HMAC-only 鉴权时代的「密钥」：t1 归属 source=ci，t2 归属 source=other（路由测试用）
+TOKEN = "selftest-token"
+TOKEN_OTHER = "selftest-token-other"
+
+
+def ws_auth() -> str:
+    """WS 握手查询串签名（每次连接新 nonce，防重放拒绝）。"""
+    return urlencode({**sig_query("GET", "/ws", TOKEN), "source": "ci"})
 PORT = 10087              # 网关
 QQ_PORT = 10088           # 假 QQ API
 WS_PORT = 10089           # 假下游 WebSocket
 
 received_ws: list[dict] = []
-
-
-def _sign(source: str, method: str, path: str, body: bytes) -> dict:
-    """按 HMAC v1 对请求签名（source 决定用哪把钥匙及其归属）。"""
-    key_id, secret = KEYS[source]
-    ts = str(int(time.time()))
-    nonce = secrets.token_hex(8)
-    body_hex = hashlib.sha256(body or b"").hexdigest()
-    canonical = "\n".join([method.upper(), path, ts, nonce, body_hex]).encode("utf-8")
-    sig = "v1=" + hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
-    return {
-        "X-Noti-Signature": sig,
-        "X-Noti-Timestamp": ts,
-        "X-Noti-Nonce": nonce,
-        "X-Noti-Key-Id": key_id,
-        "X-Source": source,
-    }
-
-
-def _ws_url(source: str) -> str:
-    """入站 WS：签名头走查询串（浏览器式），canonical 为 GET /ws 空体。"""
-    key_id, secret = KEYS[source]
-    ts = str(int(time.time()))
-    nonce = secrets.token_hex(8)
-    body_hex = hashlib.sha256(b"").hexdigest()
-    canonical = "\n".join(["GET", "/ws", ts, nonce, body_hex]).encode("utf-8")
-    sig = "v1=" + hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
-    q = urllib.parse.urlencode({"sig": sig, "ts": ts, "nonce": nonce,
-                                "key_id": key_id, "source": source})
-    return f"ws://127.0.0.1:{PORT}/ws?{q}"
-
-
-async def _post_json(c: httpx.AsyncClient, url: str, payload: dict, source: str = "ci") -> httpx.Response:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    path = urllib.parse.urlparse(url).path
-    return await c.post(url, content=body,
-                        headers={**_sign(source, "POST", path, body),
-                                 "content-type": "application/json"})
 
 
 # --------------------------------------------------------------------------
@@ -139,10 +102,9 @@ def build_mock_ws() -> FastAPI:
     return app
 
 
-def make_config(keys_path: str) -> str:
-    return f"""
+CONFIG = f"""
 server: {{ host: 127.0.0.1, port: {PORT} }}
-auth: {{ keys_file: "{keys_path}" }}
+auth: {{ keys_file: "keys", strict_source: false }}
 limits: {{ per_source_per_minute: 60, per_target_per_minute: 30, per_target_per_day: 1000 }}
 dedup: {{ enabled: true, window_seconds: 60 }}
 dispatch: {{ poll_interval: 0.2, concurrency: 4, max_attempts: 3 }}
@@ -186,13 +148,12 @@ async def wait_up(url: str, tries: int = 80) -> bool:
 
 async def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="noti-selftest-"))
-    keys_path = tmp / "keys.conf"
-    keys_path.write_text(
-        "".join(f"{kid} {sec} kind=hmac source={src}\n" for src, (kid, sec) in KEYS.items()),
-        encoding="utf-8",
-    )
     cfg_path = tmp / "config.yaml"
-    cfg_path.write_text(make_config(str(keys_path).replace("\\", "/")), encoding="utf-8")
+    cfg_path.write_text(CONFIG, encoding="utf-8")
+    # 密钥表（config.py 把相对 keys_file 按配置文件目录解析）
+    (tmp / "keys").write_text(
+        f"t1 {TOKEN} source=ci\nt2 {TOKEN_OTHER} source=other\n", encoding="utf-8"
+    )
     os.environ["NOTI_DB"] = str(tmp / "test.db")
     os.environ["NOTI_CONFIG"] = str(cfg_path)
 
@@ -223,25 +184,29 @@ async def main() -> int:
         if not cond:
             failures.append(name)
 
-    async with httpx.AsyncClient(timeout=15) as c:
+    H: dict[str, str] = {}  # 签名由 HmacClient 自动完成；source 取密钥归属 ci
+
+    async with HmacClient(secret=TOKEN, timeout=15) as c, \
+            HmacClient(secret=TOKEN_OTHER, timeout=15) as c_other:
         print("\n[1] 鉴权")
-        check((await c.post(f"{base}/n/ci?token=wrong", content="x")).status_code == 401, "旧式 token 调用 -> 401")
-        check((await c.post(f"{base}/n/ci", content="x")).status_code == 401, "无签名 -> 401")
-        check((await c.post(f"{base}/n/ci", content="x", headers={
-            "X-Noti-Signature": "v1=00", "X-Noti-Timestamp": str(int(time.time())),
-            "X-Noti-Nonce": "bad-1"})).status_code == 401, "坏签名 -> 401")
+        async with httpx.AsyncClient(timeout=15) as raw:
+            bad = sign_headers("POST", "/n/ci", b"x", "wrong-secret")
+            check((await raw.post(f"{base}/n/ci", content="x", headers=bad)).status_code == 401,
+                  "错误密钥（签名不匹配）-> 401")
+            check((await raw.post(f"{base}/n/ci", content="x")).status_code == 401,
+                  "缺签名 -> 401")
 
         print("\n[2] 异步入队 + 后台投递")
-        r = await _post_json(c, f"{base}/n/ci?title=构建失败&body=main", {"level": "error"}, "ci")
+        r = await c.post(f"{base}/n/ci?title=构建失败&body=main", headers=H, json={"level": "error"})
         check(r.status_code == 202, f"异步返回 202 (实际 {r.status_code})")
         ev = r.json().get("event_id")
         await asyncio.sleep(1.5)
 
-        st = (await c.get(f"{base}/_stats", headers=_sign("ci", "GET", "/_stats", b""))).json()
+        st = (await c.get(f"{base}/_stats?token={TOKEN}")).json()
         check(st["counters"]["sent"] >= 2, f"投递 2 个 target (实际 sent={st['counters']['sent']})")
         check(st["counters"]["dead"] == 0, "无死信")
 
-        rec = (await c.get(f"{base}/_receipt/{ev}", headers=_sign("ci", "GET", f"/_receipt/{ev}", b""))).json()
+        rec = (await c.get(f"{base}/_receipt/{ev}?token={TOKEN}")).json()
         check(len(rec["results"]) == 2, "回执 2 条")
         check(all(x["state"] == "done" for x in rec["results"]), "回执全部 done")
 
@@ -253,44 +218,40 @@ async def main() -> int:
         got = (await c.get(f"http://127.0.0.1:{WS_PORT}/_received")).json()
         check(got["count"] >= 1, f"出站 WS 收到消息 (实际 {got['count']})")
         check(bool(got["items"]) and got["items"][0].get("action") == "send_group_msg", "WS 模板渲染正确")
-        st = (await c.get(f"{base}/_stats", headers=_sign("ci", "GET", "/_stats", b""))).json()
+        st = (await c.get(f"{base}/_stats?token={TOKEN}")).json()
         conns = st["targets"]["ws:onebot"]["connections"]
         check(len(conns) == 2, f"同时维持 2 条连接 (实际 {len(conns)})")
         check(all(x["state"] == "open" for x in conns), "连接均为 open")
         check(sum(x["sent"] for x in conns) >= 1, "连接有发送计数")
 
         print("\n[4] 同步投递 ?wait=1")
-        r = await _post_json(c, f"{base}/n/ci?wait=1&title=同步测试",
-                             {"level": "error", "body": "hi"}, "ci")
+        r = await c.post(f"{base}/n/ci?wait=1&title=同步测试", headers=H,
+                         json={"level": "error", "body": "hi"})
         check(r.status_code == 200, f"同步返回 200 (实际 {r.status_code})")
         js = r.json()
         check(js.get("results", {}).get("qq:default", {}).get("ok") is True, "QQ 同步回执成功")
         check(js.get("results", {}).get("ws:onebot", {}).get("ok") is True, "WS 同步回执成功")
 
         print("\n[5] 聚合去重")
-        r1 = await _post_json(c, f"{base}/n/ci", {"level": "error", "title": "重复标题"}, "ci")
-        r2 = await _post_json(c, f"{base}/n/ci", {"level": "error", "title": "重复标题"}, "ci")
+        r1 = await c.post(f"{base}/n/ci", headers=H, json={"level": "error", "title": "重复标题"})
+        r2 = await c.post(f"{base}/n/ci", headers=H, json={"level": "error", "title": "重复标题"})
         check(r1.json().get("suppressed") is not True, "第一条正常入队")
         check(r2.json().get("suppressed") is True, "第二条被抑制")
 
         print("\n[6] 路由匹配")
-        r = await _post_json(c, f"{base}/n/x", {"level": "info", "title": "t"}, "other")
+        # HMAC 下 source 由密钥归属决定：t2 的密钥归属 other，不采信请求头
+        r = await c_other.post(f"{base}/n/x", json={"level": "info", "title": "t"})
         await asyncio.sleep(1.0)
         ev2 = r.json().get("event_id")
-        rec2 = (await c.get(f"{base}/_receipt/{ev2}", headers=_sign("other", "GET", f"/_receipt/{ev2}", b""))).json()
+        rec2 = (await c.get(f"{base}/_receipt/{ev2}?token={TOKEN}")).json()
         ids = [x["target_id"] for x in rec2["results"]]
         check(ids == ["qq:default"], f"非 ci 来源只走兜底路由 (实际 {ids})")
 
         print("\n[7] 入站格式兼容")
-        body_txt = "纯文本第一行\n第二行".encode("utf-8")
-        r = await c.post(f"{base}/n/ci", content=body_txt,
-                         headers={**_sign("ci", "POST", "/n/ci", body_txt),
-                                  "content-type": "text/plain"})
+        r = await c.post(f"{base}/n/ci", headers={**H, "content-type": "text/plain"},
+                         content="纯文本第一行\n第二行")
         check(r.status_code in (200, 202), f"text/plain 接受 (实际 {r.status_code})")
-        body_form = urllib.parse.urlencode({"title": "表单", "level": "error"}).encode("ascii")
-        r = await c.post(f"{base}/n/ci", content=body_form,
-                         headers={**_sign("ci", "POST", "/n/ci", body_form),
-                                  "content-type": "application/x-www-form-urlencoded"})
+        r = await c.post(f"{base}/n/ci", headers=H, data={"title": "表单", "level": "error"})
         check(r.status_code in (200, 202), "form-urlencoded 接受")
         from noti_gateway.ingest import _parse_body
         t_gbk = _parse_body("中文GBK回落测试".encode("gbk"), "text/plain")
@@ -299,24 +260,24 @@ async def main() -> int:
         check("✅" in t_u8 and "UTF-8" in t_u8, "严格 UTF-8 不受回落影响")
 
         print("\n[8] 入站 WebSocket")
-        async with websockets.connect(_ws_url("ci")) as w:
+        async with websockets.connect(f"ws://127.0.0.1:{PORT}/ws?{ws_auth()}") as w:
             await w.send(json.dumps({"title": "来自WS", "level": "error", "body": "b"}))
             resp = json.loads(await asyncio.wait_for(w.recv(), timeout=5))
             check(resp.get("queued") is True, "WS 上行被接收并入队")
         try:
-            bad_q = urllib.parse.urlencode({"sig": "v1=deadbeef",
-                                            "ts": str(int(time.time())), "nonce": "bad-ws"})
+            bad_q = urlencode(sig_query("GET", "/ws", "wrong-secret"))
             async with websockets.connect(f"ws://127.0.0.1:{PORT}/ws?{bad_q}") as w:
                 await asyncio.wait_for(w.recv(), timeout=3)
-            check(False, "WS 坏签名被拒绝")
+            check(False, "WS 错误密钥被拒绝")
         except Exception:
-            check(True, "WS 坏签名被拒绝")
+            check(True, "WS 错误密钥被拒绝")
 
         print("\n[9] 观测接口")
         check((await c.get(f"{base}/_health")).json()["ok"] is True, "/_health ok")
-        check((await c.get(f"{base}/_stats", headers=_sign("ci", "GET", "/_stats", b""))).status_code == 200, "/_stats 可用")
-        check((await c.get(f"{base}/_failures", headers=_sign("ci", "GET", "/_failures", b""))).status_code == 200, "/_failures 受保护访问")
-        check((await c.get(f"{base}/_failures")).status_code == 401, "/_failures 无签名 -> 401")
+        check((await c.get(f"{base}/_stats?token={TOKEN}")).status_code == 200, "/_stats 可用")
+        check((await c.get(f"{base}/_failures?token={TOKEN}")).status_code == 200, "/_failures 受保护访问")
+        async with httpx.AsyncClient(timeout=15) as raw:
+            check((await raw.get(f"{base}/_failures")).status_code == 401, "/_failures 无签名 -> 401")
 
     for s in servers:
         s.should_exit = True

@@ -158,14 +158,38 @@ class RouteCfg:
 
 @dataclass
 class ChatdownloadCfg:
-    # 私聊消息归档（chatdownload）：复用 qq 段同一个机器人，WS 收 C2C 消息落盘
+    # 私聊消息归档（chatdownload）：qqws 插件收 C2C 消息后广播，本插件只负责落盘
     # 布局固定：chat.txt（文本）+ media/（图片与文件）+ events.jsonl（防丢流水）
     enabled: bool = False
     data_dir: str = "quest"  # 归档目录（相对运行目录）
     target_users: list[str] = field(default_factory=list)  # user_openid 白名单；空 = 全部
     download_concurrency: int = 2
-    # 绑定哪个机器人收消息（bots[].id）；留空 = 第一个带凭据的 bot，再无则回落旧式全局 qq 段
+    # 兼容保留：连接归属优先看 qqws.bot；两者都留空时才用它（历史配置的 bot 字段）
     bot: str = ""
+
+
+@dataclass
+class QqwsCfg:
+    # QQ 官方网关长连接插件（qqws）：全进程唯一的收消息入口，
+    # 收到 dispatch 事件后广播给其他插件（chatdownload 归档、reminders 指令等）
+    enabled: bool = False
+    # 连接用哪台机器人的凭据（bots[].id）；留空 = 依次回落 chatdownload.bot >
+    # 第一个带凭据的 bot > 旧式全局 qq 段
+    bot: str = ""
+
+
+@dataclass
+class AgentsCfg:
+    # Agent 通知处理插件（agents）：ZCode/OpenCode/DSH/WorkBuddy 等来源的通知中间件
+    enabled: bool = False
+    # 适用来源（X-Source / HMAC 密钥归属）；不在列表内的通知原样通过
+    sources: list[str] = field(default_factory=lambda: ["zcode", "opencode", "dsh", "workbuddy"])
+    # 静默时段（东八区，HH:MM-HH:MM，支持跨午夜如 "23:00-07:30"）；空 = 不静默
+    quiet_hours: str = ""
+    # 静默时段内被丢弃的通知级别
+    quiet_levels: list[str] = field(default_factory=lambda: ["info"])
+    # per-source 呈现模板（{{ title }} / {{ body }} 等）；未配置的 source 原样通过
+    templates: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -175,6 +199,27 @@ class UploadsCfg:
     ttl: int = 86400                    # 上传件保留秒数，过期自动清理
     chunk_size: int = 4 * 1024 * 1024   # 建议分片大小（字节）
     max_size: int = 190 * 1024 * 1024   # 单件上限（QQ 分片通道实测 200MB，留余量）
+
+
+@dataclass
+class RemindersCfg:
+    # 定时提醒插件：一次性/每天/每周/工作日/cron，HTTP /schedule + QQ 固定语法命令
+    enabled: bool = True
+    source: str = "remind"        # 提醒投递/回复用的 source（走 routes 路由扇出）
+    grace_seconds: int = 900      # 错过补发窗口：停机跨过触发点，重启后窗口内补发
+    tick_seconds: float = 1.0     # 调度扫描间隔秒
+    max_list: int = 20            # 「提醒 列表」最多展示条数
+
+
+@dataclass
+class WebchatCfg:
+    # WebChat 网页消息面板插件：网页实时查看/发送 QQ 单聊消息（迁移自 bison2）
+    enabled: bool = False
+    totp_secret: str = ""         # TOTP 密钥（Base32，验证器 App 绑定用）；留空自动生成并持久到 data_dir
+    session_days: int = 7         # 登录会话令牌有效期（天）
+    max_per_chat: int = 300       # 每会话内存保留条数
+    persist: bool = True          # jsonl 落盘（重启恢复最近历史）
+    data_dir: str = "webchat"     # 落盘目录（相对运行目录）
 
 
 @dataclass
@@ -189,8 +234,15 @@ class Config:
     routes: list[RouteCfg]
     ingest: IngestCfg = field(default_factory=IngestCfg)
     chatdownload: ChatdownloadCfg = field(default_factory=ChatdownloadCfg)
+    qqws: QqwsCfg = field(default_factory=QqwsCfg)
+    agents: AgentsCfg = field(default_factory=AgentsCfg)
     uploads: UploadsCfg = field(default_factory=UploadsCfg)
+    reminders: RemindersCfg = field(default_factory=RemindersCfg)
+    webchat: WebchatCfg = field(default_factory=WebchatCfg)
     default_route: str = "default"
+    # 插件清单：noti_gateway/plugins/ 下不以 _ 开头的模块名。
+    # 顺序即事件分发顺序：qqws 持有连接，chatdownload 归档在前，命令类插件在后
+    plugins: list[str] = field(default_factory=lambda: ["qqws", "chatdownload", "reminders", "agents"])
     # 多机器人：bots[].targets 已平铺进 targets，此处保留结构用于凭据解析/展示
     bots: list[BotCfg] = field(default_factory=list)
 
@@ -228,6 +280,15 @@ class Config:
             if b.app_id and b.client_secret:
                 return b.id, b.qq()
         return "", self.qq
+
+    def qqws_bot(self) -> tuple[str, QQCfg]:
+        """网关长连接绑定的机器人：qqws.bot > chatdownload.bot > 第一个带凭据的 bot > 旧式全局段。"""
+        if self.qqws.bot:
+            b = self.bot(self.qqws.bot)
+            if b is None:
+                raise SystemExit(f"qqws.bot 引用了不存在的 bot: {self.qqws.bot}")
+            return b.id, b.qq()
+        return self.chatdownload_bot()
 
 
 def _dd(d: dict[str, Any], cls):
@@ -304,8 +365,13 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         routes=routes,
         ingest=_dd(raw.get("ingest"), IngestCfg),
         chatdownload=_dd(raw.get("chatdownload"), ChatdownloadCfg),
+        qqws=_dd(raw.get("qqws"), QqwsCfg),
+        agents=_dd(raw.get("agents"), AgentsCfg),
         uploads=_dd(raw.get("uploads"), UploadsCfg),
+        reminders=_dd(raw.get("reminders"), RemindersCfg),
+        webchat=_dd(raw.get("webchat"), WebchatCfg),
         default_route=raw.get("default_route", "default"),
+        plugins=[str(p) for p in (raw.get("plugins") or ["qqws", "chatdownload", "reminders", "agents"])],
         bots=bots,
     )
 
@@ -326,6 +392,21 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
             raise SystemExit(f"target {t.id} 引用了不存在的 bot: {t.bot}")
     if cfg.chatdownload.bot and cfg.chatdownload.bot not in bot_ids:
         raise SystemExit(f"chatdownload.bot 引用了不存在的 bot: {cfg.chatdownload.bot}")
+    if cfg.qqws.bot and cfg.qqws.bot not in bot_ids:
+        raise SystemExit(f"qqws.bot 引用了不存在的 bot: {cfg.qqws.bot}")
+    # 一个 appid 只有一条事件流：连接插件与归档器必须指向同一台机器人
+    if (cfg.chatdownload.enabled and cfg.qqws.bot and cfg.chatdownload.bot
+            and cfg.qqws.bot != cfg.chatdownload.bot):
+        raise SystemExit(
+            f"qqws.bot({cfg.qqws.bot}) 与 chatdownload.bot({cfg.chatdownload.bot}) 不一致："
+            "一个 appid 只有一条事件流，两者必须指向同一台机器人"
+        )
+    # 归档器依赖事件流：qqws 必须启用且在插件清单里
+    if cfg.chatdownload.enabled:
+        if not cfg.qqws.enabled:
+            raise SystemExit("chatdownload.enabled=true 需要 qqws 提供事件流（请设置 qqws.enabled=true）")
+        if "qqws" not in cfg.plugins:
+            raise SystemExit("chatdownload.enabled=true 但 plugins 清单里没有 qqws，归档器将收不到任何消息")
     for r in routes:
         for tid in r.targets:
             if tid not in ids:

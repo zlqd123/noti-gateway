@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- QQ 图片 CDN 拒绝带非 QQ 站点 Referer 的请求，去掉 Referer 即可直连 -->
+  <meta name="referrer" content="no-referrer">
+  <title>WebChat 消息面板</title>
+  <link rel="stylesheet" href="/webchat/static/app.css?v=8">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <header class="side-head">
+        <div class="brand">
+          <span class="brand-dot" id="botDot"></span>
+          <span class="brand-title">WebChat 消息面板</span>
+        </div>
+        <div class="brand-sub" id="botSub">正在连接机器人…</div>
+      </header>
+      <div class="side-search">
+        <input id="search" type="text" placeholder="搜索会话（名称 / openid）" autocomplete="off">
+      </div>
+      <nav class="chat-list" id="chatList"></nav>
+      <footer class="side-foot">
+        <span>刷新或关闭页面均需重新验证</span><a href="#" id="resetToken">重新登录</a>
+      </footer>
+    </aside>
+
+    <main class="main">
+      <header class="chat-head" id="chatHead">
+        <button class="icon-btn back-btn" id="backBtn" title="返回会话列表">‹</button>
+        <div class="chat-head-title">
+          <div class="chat-title" id="chatTitle">选择一个会话</div>
+          <div class="chat-sub" id="chatSub"></div>
+        </div>
+        <button class="icon-btn" id="renameBtn" title="重命名会话（仅本地显示）" hidden>✎</button>
+      </header>
+
+      <section class="msg-area" id="msgArea">
+        <div class="load-more-wrap" id="loadMoreWrap" hidden>
+          <button class="load-more" id="loadMoreBtn">加载更早的消息</button>
+        </div>
+        <div class="msg-list" id="msgList"></div>
+      </section>
+
+      <footer class="composer">
+        <div class="mention-popup" id="mentionPopup" hidden></div>
+        <div class="reply-chip" id="replyChip" hidden>
+          <span class="reply-chip-label">回复</span>
+          <span class="reply-chip-text" id="replyChipText"></span>
+          <button id="replyClear" class="reply-clear" title="取消回复">✕</button>
+        </div>
+        <div class="attach-chip" id="attachChip" hidden>
+          <img id="attachChipThumb" alt="" hidden>
+          <span id="attachChipName"></span>
+          <span id="attachChipSize" class="attach-size"></span>
+          <button id="attachClear" class="reply-clear" title="移除附件">✕</button>
+        </div>
+        <div class="mode-row">
+          <label class="mode"><input type="radio" name="mode" value="passive">
+            <span>被动回复</span></label>
+          <label class="mode"><input type="radio" name="mode" value="active" checked>
+            <span>主动发送</span></label>
+          <span class="mode-hint">Ctrl+Enter 发送 · Enter 换行</span>
+        </div>
+        <div class="input-row">
+          <!-- @提及：官方接口 <at:openid> 个人提及实测未生效，先下线 -->
+          <!-- <button id="atBtn" class="tool-btn" title="@ 成员">@</button> -->
+          <button id="attachBtn" class="tool-btn" title="发送图片/文件">📎</button>
+          <input type="file" id="fileInput" hidden>
+          <textarea id="input" rows="2" placeholder="输入消息…"></textarea>
+          <button id="sendBtn" class="send-btn" disabled>发送</button>
+        </div>
+        <div class="status-line" id="statusLine"></div>
+      </footer>
+    </main>
+  </div>
+
+  <div class="token-overlay" id="tokenOverlay" hidden>
+    <div class="token-card">
+      <h2>WebChat 消息面板</h2>
+      <p>请输入验证器 App 中的 6 位动态码（TOTP，每 30 秒刷新）</p>
+      <input id="tokenInput" type="text" inputmode="numeric" maxlength="6"
+             placeholder="000000" autocomplete="one-time-code">
+      <button id="tokenSave" class="token-save">登 录</button>
+      <div class="token-err" id="tokenErr"></div>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="/webchat/static/app.js?v=9"></script>
+</body>
+</html>

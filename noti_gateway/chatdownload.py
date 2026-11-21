@@ -112,11 +112,15 @@ class ChatDownloader:
         qq: QQCfg,
         tokens: QQTokenCache,
         client: httpx.AsyncClient,
+        on_message: Any | None = None,
     ) -> None:
         self.cfg = cfg
         self.qq = qq
         self.tokens = tokens
         self.client = client  # 复用网关共享 client（取 /gateway 地址用）
+        # 命令钩子（插件注册，如 reminders）：白名单用户消息归档后调用
+        # async (text, event) -> None；回复由钩子自己经调度器投递，这里只负责归档
+        self._on_message = on_message
 
         self.data_dir = Path(cfg.data_dir)
         self.media_dir = self.data_dir / "media"
@@ -352,6 +356,13 @@ class ChatDownloader:
         text = (d.get("content") or "").strip()
         if text:
             self._append_chat(text)
+
+        # 防丢账本先落盘，再让插件处理文本消息（命令回复由插件经调度器投递）
+        if self._on_message is not None and text:
+            try:
+                await self._on_message(text, d)
+            except Exception:
+                log.exception("chatdownload 命令钩子异常")
 
         atts = [a for a in (d.get("attachments") or []) if isinstance(a, dict)]
         for i, att in enumerate(atts):

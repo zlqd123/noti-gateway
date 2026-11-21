@@ -57,6 +57,7 @@ targets:
   - {id: hook:extra, type: webhook, url: "http://x", remark: "外挂"}
 routes:
   - {source: ["*"], targets: [qq:me, qq:bak]}
+qqws: {enabled: true}
 chatdownload: {enabled: true, bot: backup}
 """
 
@@ -135,6 +136,7 @@ auth: {keys_file: k}
 targets: [{id: x, type: qq}]
 routes:
   - {source: ["*"], targets: [x]}
+qqws: {enabled: true}
 chatdownload: {enabled: true, bot: ghost}
 """, "引用了不存在的 bot"),
     ]

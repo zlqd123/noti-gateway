@@ -31,11 +31,14 @@ class SubmitError(Exception):
 
 
 class Dispatcher:
-    def __init__(self, cfg: Config, store: Store, reg: Registry, hub=None) -> None:
+    def __init__(self, cfg: Config, store: Store, reg: Registry, hub=None,
+                 middleware: list | None = None) -> None:
         self.cfg = cfg
         self.store = store
         self.reg = reg
         self.hub = hub  # 可选事件总线：有则向 SSE /stream 订阅者广播
+        # 通知中间件：入队前依次调用，可改写通知或返回 None 丢弃（见 plugins.agents）
+        self.middleware = middleware or []
         self.source_limiter = RateLimiter(cfg.limits.per_source_per_minute)
         self.target_limiters: dict[str, RateLimiter] = {
             t.id: RateLimiter(t.limit(cfg.limits.per_target_per_minute), cfg.limits.per_target_per_day)
@@ -58,6 +61,7 @@ class Dispatcher:
             "suppressed": 0,
             "rate_limited": 0,
             "deferred": 0,
+            "dropped": 0,
         }
 
     # ---------------- 路由 ----------------
@@ -83,10 +87,24 @@ class Dispatcher:
             "title": n.title, "targets": targets, "sync": sync,
         })
 
-    async def submit(self, n: Notification, wait: bool = False) -> dict:
+    async def submit(self, n: Notification, wait: bool = False, dedup: bool = True) -> dict:
         self.counters["received"] += 1
+        event_id = n.event_id
 
-        if self.deduper and self.deduper.seen(n.dedup_key):
+        # 通知中间件：依次改写；返回 None = 丢弃（如 agents 静默时段过滤）
+        for mw in self.middleware:
+            try:
+                n = await mw(n)
+            except Exception:
+                log.exception("通知中间件 %r 异常", getattr(mw, "__qualname__", mw))
+                continue
+            if n is None:
+                self.counters["dropped"] += 1
+                self._pub("dropped", {"event_id": event_id, "reason": "middleware"})
+                return {"queued": False, "dropped": True, "event_id": event_id}
+
+        # dedup=False 供定时提醒等「用户主动创建的离散事件」使用，避免被告警风暴窗口吞掉
+        if dedup and self.deduper and self.deduper.seen(n.dedup_key):
             self.counters["suppressed"] += 1
             self._pub("suppressed", {
                 "event_id": n.event_id, "source": n.source, "title": n.title,

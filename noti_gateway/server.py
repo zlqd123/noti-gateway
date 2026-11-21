@@ -18,12 +18,12 @@ from pathlib import Path
 
 from . import uploads as upmod
 from .auth import AuthError, check_request, check_websocket
-from .chatdownload import ChatDownloader
 from .config import Config, load_config
 from .dailylog import DailyFileHandler
 from .dispatcher import Dispatcher, SubmitError
 from .hub import Hub
 from .ingest import MAX_BODY, build_notification, parse_http
+from .plugins import PluginCtx, setup_plugins
 from .store import Store
 from .targets import QQTokenCache, build_targets
 
@@ -64,14 +64,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # 分片上传收件：/u/* 的暂存区（默认 NOTI_DB 同级 uploads/，可用 uploads.dir 覆盖）
     upmod.configure(cfg.uploads, base_dir=Path(DB_PATH).resolve().parent)
     hub = Hub(buffer=cfg.ingest.sse_buffer)
-    disp = Dispatcher(cfg, store, reg, hub=hub)
-    # 私聊消息归档（chatdownload）：绑定一台机器人（bot 字段指定或自动选第一台），WS 收 C2C 消息落盘
-    cd = None
-    if cfg.chatdownload.enabled:
-        cd_bot_id, cd_qq = cfg.chatdownload_bot()
-        if cd_qq.app_id and cd_qq.client_secret:
-            cd_tokens = reg.token_caches.get(cd_bot_id, reg.token_caches[""])
-            cd = ChatDownloader(cfg.chatdownload, cd_qq, cd_tokens, client)
+    # 插件上下文先于 Dispatcher 创建：通知中间件列表要传给 Dispatcher
+    plg = PluginCtx(app=app, cfg=cfg, db_path=DB_PATH, hub=hub, client=client,
+                    reg=reg, store=store)
+    disp = Dispatcher(cfg, store, reg, hub=hub, middleware=plg.notification_middleware)
+    plg.disp = disp
+    setup_plugins(plg)
 
     app.state.cfg = cfg
     app.state.client = client
@@ -79,7 +77,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.state.store = store
     app.state.dispatcher = disp
     app.state.hub = hub
-    app.state.chatdownload = cd
+    app.state.plugins = plg
     # 入站长连接注册表：WS 按连接 id 记账，SSE 只计数
     app.state.ws_conns: dict[int, dict[str, Any]] = {}
     app.state.ws_seq = itertools.count(1)
@@ -93,8 +91,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if recovered:
             log.info("recovered %d inflight task(s) from previous run", recovered)
         await reg.start_all()
-        if cd is not None:
-            await cd.start()
+        await plg.run_startup()
         app.state.worker = asyncio.create_task(disp.run_worker(), name="noti-worker")
         log.info(
             "noti-gateway ready  port=%s  targets=%s",
@@ -105,14 +102,13 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     async def _shutdown() -> None:
         log.info("draining queue before shutdown ...")
         await disp.stop()
+        await plg.run_shutdown()
         worker = getattr(app.state, "worker", None)
         if worker is not None:
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(worker, timeout=3)
         await disp.drain(timeout=10)
         await reg.close_all()
-        if cd is not None:
-            await cd.stop()
         await client.aclose()
         store.close()
         log.info("bye")
@@ -146,7 +142,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 {"error": str(e), "event_id": n.event_id, "level": n.level},
                 status_code=e.status,
             )
-        return JSONResponse(result, status_code=200 if wait or result.get("suppressed") else 202)
+        return JSONResponse(
+            result,
+            status_code=200 if (wait or result.get("suppressed") or result.get("dropped")) else 202,
+        )
 
     @app.post("/n/{route:path}")
     async def post_notify(route: str, req: Request) -> JSONResponse:
@@ -385,25 +384,26 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "ok": True,
             "targets": {k: await v.health() for k, v in reg.targets.items()},
         }
-        if cd is not None:
-            out["chatdownload"] = cd.health()
+        # 插件各自贡献健康段（qqws 连接、chatdownload 归档器…）
+        for name, fn in plg.health_providers.items():
+            out[name] = fn()
         return JSONResponse(out)
 
     @app.get("/_stats")
     async def stats() -> JSONResponse:
-        return JSONResponse(
-            {
-                "counters": disp.stats(),
-                "queue": await store.stats(),
-                "targets": reg.info(),
-                "ingest": {
-                    "ws_clients": len(app.state.ws_conns),
-                    "ws": list(app.state.ws_conns.values()),
-                    "sse_clients": app.state.sse["clients"],
-                },
-                "chatdownload": cd.info() if cd is not None else None,
-            }
-        )
+        out: dict[str, Any] = {
+            "counters": disp.stats(),
+            "queue": await store.stats(),
+            "targets": reg.info(),
+            "ingest": {
+                "ws_clients": len(app.state.ws_conns),
+                "ws": list(app.state.ws_conns.values()),
+                "sse_clients": app.state.sse["clients"],
+            },
+        }
+        for name, fn in plg.stats_providers.items():
+            out[name] = fn()
+        return JSONResponse(out)
 
     @app.get("/_receipt/{event_id}")
     async def receipt(event_id: str, req: Request) -> JSONResponse:

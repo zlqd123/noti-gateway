@@ -3,25 +3,14 @@ server:
   port: 10086          # 端口范围 0-65535；按需改成 10008 / 8080 等
 
 auth:
-  # 鉴权只支持 HMAC 多密钥（v1 签名）；keys_file 未配置会直接拒绝启动（无无鉴权模式）。
-  # 调用方式：POST /n/<source> 带签名头（客户端示例见 platform/ 各平台脚本）：
-  #   curl -X POST http://IP:10086/n/ci \
-  #     -H "X-Noti-Signature: v1=<hex>" -H "X-Noti-Timestamp: <unix秒>" \
-  #     -H "X-Noti-Nonce: <随机串>" -H "X-Noti-Key-Id: <密钥代号>" -d "构建失败"
-  # WebSocket /ws 握手同样要签名（canonical 用 GET /ws + 空体哈希）：
-  #   签名头可走握手 header，或查询参数 ?sig=&ts=&nonce=&key_id=
+  # 共享 Token。调用方式：
+  #   curl -H "Authorization: Bearer <token>" http://IP:10086/n/ci -d "构建失败"
+  #   curl "http://IP:10086/n/ci?token=<token>" -d "构建失败"
+  # WebSocket:   ws://IP:100086/ws?token=<token>
+  token: "change-me-please"
+  allow_query_token: true
   # 可选：来源 IP 白名单（支持 CIDR）
   ip_allow: []
-
-  # HMAC 多密钥文件（每次鉴权都实时读盘，坏行静默忽略，随时编辑随时启用）。
-  # 格式：  <id> <secret> [kind=hmac] [source=NAME] [enabled=0|1]
-  # 命中任一密钥即通过；来源以命中密钥的 source 为准（X-Source 仅在 strict_source 下校验）。
-  # 签名（v1）：canonical = METHOD\nPATH\nTS\nNONCE\nBODY_SHA256_HEX
-  #   X-Noti-Signature: v1=<HMAC_SHA256(secret, canonical) hex>
-  #   配套头：X-Noti-Timestamp / X-Noti-Nonce / X-Noti-Content-SHA256 / X-Noti-Key-Id
-  keys_file: "keys.conf"   # 必填；相对路径按 config.yaml 所在目录解析
-  hmac_window_sec: 300     # 时间窗，配合 nonce 防重放
-  strict_source: false     # true 时强制 X-Source 与命中密钥的 source 相符
 
 limits:
   per_source_per_minute: 60
@@ -54,28 +43,6 @@ qq:
   app_id: ""
   client_secret: ""
   api_base: "https://api.bot.qq.com"
-
-# --- 多机器人（bots）：每台机器人可挂多个目标，机器人/目标都可加中文备注 remark ---
-# bots[].targets 里的目标会自动平铺进全局目标表（bot 字段回填机器人 id），
-# 路由/分发不感知 bot 结构；目标 type 省略时默认 qq。
-# 旧式写法（上方 qq 段 + 下方 targets）依然兼容，两种可混用。
-bots:
-  - id: bot-a                     # 机器人 id，chatdownload.bot / 目标归属引用它
-    remark: "主力机器人"           # 中文备注（仅展示，出现在 /_stats）
-    app_id: "REPLACE_WITH_APP_ID"
-    client_secret: "REPLACE_WITH_CLIENT_SECRET"
-    api_base: "https://api.bot.qq.com"
-    targets:
-      - id: qq:default            # 目标 id 全局唯一
-        remark: "测试群"
-        group_openid: "REPLACE_WITH_YOUR_GROUP_OPENID"   # 群场景
-        # user_openid: ""         # 单聊场景，二选一
-        # channel_id: ""          # 频道场景（官方要求 WS 在线）
-        msg_type: 0               # 0=文本 2=Markdown
-        rate_per_minute: 25
-      - id: qq:me
-        remark: "手机单聊"
-        user_openid: "REPLACE_WITH_YOUR_USER_OPENID"
 
 targets:
   # --- QQ 群机器人（发消息是纯 HTTP，不需要维持 WebSocket）---
@@ -119,14 +86,42 @@ routes:
   - source: ["*"]              # 兜底
     targets: [qq:default, hook:example]
 
-# 私聊消息归档（chatdownload）：绑定一台机器人（bots[].id），WS 长连接收单聊消息实时落盘
-# 归档布局：<data_dir>/chat.txt（全部文本，一行一条）、media/（图片/文件/视频同一子目录）、
-#           events.jsonl（原始事件流水，先落盘后下载，防丢账本）、error.jsonl（下载失败记录）
-# 按需求裁剪：不补历史、不做去重、不回消息
+# 插件清单（noti_gateway/plugins/ 下的模块名），顺序即事件分发顺序：
+# qqws 独占 QQ 长连接并广播事件流，chatdownload 归档在前，命令类插件在后
+plugins: ["qqws", "chatdownload", "reminders", "webchat"]
+
+# QQ 官方网关长连接插件（qqws）：全进程唯一的收消息入口，收到事件广播给其他插件
+qqws:
+  enabled: true              # chatdownload.enabled=true 时必须开启（事件流来源）
+  bot: ""                    # 连接用哪台机器人（bots[].id）；留空回落 chatdownload.bot >
+                             # 第一个带凭据的 bot > 旧式全局 qq 段
+
+# 私聊消息归档插件（chatdownload）：订阅 qqws 的事件流，白名单用户单聊实时落盘
+# 归档布局：<data_dir>/chat.txt（全部文本）+ media/（图片/文件）+
+#           events.jsonl（原始事件流水，先落盘后下载，防丢账本）+ error.jsonl（下载失败记录）
 # 硬限制：QQ 开放平台无历史消息接口，离线期间消息永久丢失
 chatdownload:
   enabled: false
-  bot: ""                # 绑定 bots[].id；留空 = 第一个带凭据的 bot（无 bots 时用 qq 段）
   data_dir: "quest"          # 归档目录（相对运行目录）
   target_users: []           # user_openid 白名单；空 = 归档全部单聊
   download_concurrency: 2    # 图片/文件并发下载数
+
+# 定时提醒插件（reminders）：一次性/每天/每周(多天)/工作日/周末/每月/每年/间隔/cron
+# 双入口：HTTP POST /schedule + QQ 发指令「#提醒 <时间> <内容>」（详见 README 对应章节）
+reminders:
+  enabled: true
+  source: remind             # 提醒投递/回复用的 source（走 routes 路由扇出）
+  grace_seconds: 900         # 错过补发窗口：停机跨过触发点，重启后窗口内补发并注明原定时间
+  tick_seconds: 1.0          # 调度扫描间隔秒
+  max_list: 20               # 「提醒 列表」最多展示条数
+
+# WebChat 网页消息面板插件（webchat）：网页实时查看/发送 QQ 单聊消息（迁移自 bison2）
+# 访问 http://<host>:<port>/webchat/ ，用验证器 App 的 TOTP 动态码登录；
+# totp_secret 留空则自动生成并持久到 data_dir，首次启用从启动日志或 /_stats 取
+webchat:
+  enabled: false
+  totp_secret: ""            # Base32 密钥；留空自动生成（绑定验证器用）
+  session_days: 7            # 登录会话令牌有效期（天）
+  max_per_chat: 300          # 每会话内存保留条数
+  persist: true              # jsonl 落盘（重启恢复最近历史）
+  data_dir: "webchat"        # 落盘目录（相对运行目录）

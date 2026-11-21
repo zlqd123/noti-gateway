@@ -3,14 +3,12 @@
 统一通知网关。**一个端口（默认 `10086`）同时接收 curl / HTTP / Webhook / WebSocket 上行，并提供 SSE 事件订阅流**，支持多个客户端并发长连接，按配置扇出到 **QQ 官方机器人 / 任意 Webhook / 出站 WebSocket 连接池**。
 
 > 接入方式、连接协议细节、服务器部署与排错见 **[接入文档.md](接入文档.md)**。
-> 配套 DSH 插件（把 DSH 的通知 / 审批 / 提问接到本网关）：**[dsh-notifier-gate](https://github.com/zlqd123/dsh-notifier-gate)**。
-> 各客户端接入脚本与脱敏配置模板（ZCode / OpenCode / DSH / WorkBuddy）见 **[platform/](platform/)**。
 
 ## 为什么需要它
 
 散落在各处的 WebSocket 推送会有四个真实问题：
 
-1. **QQ 的主动消息限流是共享配额**（单聊主动：Bot 10 qps、单用户 20 条/分钟、1000 条/用户/天；群主动：60 条/分钟、1000 条/群/天；频道私信 2 条/人/天，[官方限额](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)）。多个服务各自推送 = 互相抢配额，表现为"随机丢通知"。
+1. **QQ 的主动消息限流是共享配额**（未认证 30 条/分钟，单关系 20 条/分钟，1000 条/群/天）。多个服务各自推送 = 互相抢配额，表现为"随机丢通知"。
 2. **发送失败是静默的**：QQ 失败也返回 HTTP 200，错误在 body 的 `code` 里。只判断 HTTP 状态码就永远发现不了。
 3. **多个 Gateway 连接**要各自配对 `shard` 和 `intents`，配错静默漏收；断网后 N 个服务同时重连会触发限流。
 4. **没有持久化和重试**：进程重启/部署时飞行中的消息全部丢失。
@@ -22,7 +20,7 @@
 ```bash
 cd noti-gateway
 pip install -r requirements.txt
-cp config.example.yaml config.yaml   # 然后填 keys.conf 密钥 / qq.app_id / qq.client_secret / group_openid
+cp config.example.yaml config.yaml   # 然后填 auth.token / qq.app_id / qq.client_secret / group_openid
 python -m noti_gateway.server
 ```
 
@@ -52,81 +50,59 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-> 服务端部署注意：`host` 要绑 `0.0.0.0` 并在防火墙/安全组放行端口。只绑 `127.0.0.1`
-> 时外部调用方全部连不通（表象是客户端「静默丢通知」，网关自己毫无异常）。
-
 ## 调用方式
 
-### 鉴权：HMAC v1 签名（唯一方式，无 token 通道）
-
-每个请求对 `METHOD\nPATH\nTS\nNONCE\nBODY_SHA256_HEX`（canonical）做 HMAC-SHA256，密钥来自 `keys.conf` 的 `kind=hmac` 行，随请求带四个头：
-
-| 头 | 值 |
-|---|---|
-| `X-Noti-Signature` | `v1=<hex>`，`HMAC_SHA256(secret, canonical)` |
-| `X-Noti-Timestamp` | unix 秒，需在 `hmac_window_sec`（默认 300）内 |
-| `X-Noti-Nonce` | 随机串，窗口内不可重放 |
-| `X-Noti-Key-Id` | `keys.conf` 里的密钥代号 |
-
-来源归属以**命中密钥的 source** 为准（`X-Source` 仅在 `strict_source` 下校验）。bash 现算签名（openssl）：
-
-```bash
-KEY_ID=ci; SECRET='<keys.conf 里对应 secret>'; P=/n/ci
-TS=$(date +%s); NONCE=$RANDOM$RANDOM
-BODY_HEX=$(printf '构建失败' | sha256sum | awk '{print $1}')
-SIG=v1=$(printf 'POST\n%s\n%s\n%s\n%s' "$P" "$TS" "$NONCE" "$BODY_HEX" \
-  | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
-curl -X POST "http://IP:10086$P" -H "X-Noti-Signature: $SIG" \
-     -H "X-Noti-Timestamp: $TS" -H "X-Noti-Nonce: $NONCE" \
-     -H "X-Noti-Key-Id: $KEY_ID" --data-binary '构建失败'
-```
-
-Node / Python / bash 的现成签名实现见 `platform/` 各平台脚本与 `tests/`。
-下文示例的 `${SIG_HEADERS}` 代指上表四个头（按各自 method/path/body 现算）。
+> **鉴权注意**：项目已从共享 Token 迁移到 **HMAC v1 签名**（密钥表 `keys.conf` 实时读取，
+> 随时增删改即生效，详见 `接入文档.md` §3）。下文示例中的 `Authorization: Bearer` 写法
+> 是迁移前的旧文档，实际调用一律按 HMAC 签名；签名代码见接入文档 §3 的速记模板。
 
 ### curl（最常见）
 
 ```bash
 # 异步：立刻返回 202，消息已落盘，网关后台慢慢发
-curl -X POST "http://IP:10086/n/ci" "${SIG_HEADERS[@]}" \
+curl -X POST "http://IP:10086/n/ci" \
+     -H "Authorization: Bearer <token>" \
+     -H "X-Source: ci" \
      -d "构建失败"
 
 # 同步：等平台真实回执，拿到每个 target 的成败
-curl -X POST "http://IP:10086/n/ci?wait=1" "${SIG_HEADERS[@]}" \
+curl -X POST "http://IP:10086/n/ci?wait=1" \
+     -H "Authorization: Bearer <token>" -H "X-Source: ci" \
      -d "构建失败"
 # => {"ok":false,"results":{"qq:default":{"ok":false,"code":100001,...}}}
+
+# token 走 query（不想改调用方脚本时）
+curl "http://IP:10086/n/ci?token=<token>&level=error&title=标题" -d "正文"
 ```
 
 ### JSON / 表单 / 纯文本都吃
 
 ```bash
 # JSON
-curl -X POST "http://IP:10086/n/ci" "${SIG_HEADERS[@]}" \
+curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" -H "X-Source: ci" \
      -H "Content-Type: application/json" \
      -d '{"level":"error","title":"MySQL 主库宕机","body":"10.0.0.5:3306","tags":["prod"]}'
 
 # 表单
-curl -X POST "http://IP:10086/n/ci" "${SIG_HEADERS[@]}" \
+curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" \
      -d "title=磁盘将满&body=/dev/sda1 91%"
 
 # 纯文本：第一行当标题，其余当正文
-curl -X POST "http://IP:10086/n/ci" "${SIG_HEADERS[@]}" \
+curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" \
      -H "Content-Type: text/plain" --data-binary $'备份完成\n耗时 12m'
 ```
 
 ### Webhook 风格
 
 ```bash
-curl -X POST "http://IP:10086/webhook/ci" "${SIG_HEADERS[@]}" \
-     -d '{"title":"CI failed"}'
+curl -X POST "http://IP:10086/webhook/ci?token=<t>" \
+     -H "X-Source: ci" -d '{"title":"CI failed"}'
 ```
 
 ### WebSocket 上行（多客户端并发）
 
 ```js
-// 握手也要签名：对 "GET\n/ws\nTS\nNONCE\n<空体 sha256>" 签名，
-// 四个头走握手 header，或等价查询参数 ?sig=&ts=&nonce=&key_id=
-const ws = new WebSocket("ws://IP:10086/ws?sig=v1=<hex>&ts=<ts>&nonce=<n>&key_id=ci&source=ci");
+const ws = new WebSocket("ws://IP:10086/ws?token=<t>&source=ci");
 ws.onopen = () => ws.send(JSON.stringify({ level: "error", title: "异常", body: "详情" }));
 ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","queued":true,...}
 ```
@@ -135,7 +111,7 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 
 ### SSE 订阅流
 
-带签名的 `GET /stream`（签名体为空）以 `text/event-stream` 实时推送 `submitted / receipt / dead / suppressed` 事件，可用 `&source=` `&types=` 过滤。
+`GET /stream?token=<t>` 以 `text/event-stream` 实时推送 `submitted / receipt / dead / suppressed` 事件，可用 `&source=` `&types=` 过滤，浏览器 `EventSource` 原生可用。
 
 ## 返回码含义
 
@@ -143,7 +119,7 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 |---|---|
 | `202` | **已入队**。注意：这只代表"记下来了"，不代表平台已收到 |
 | `200` | 同步模式（`wait=1`）拿到了各 target 的真实回执，看 `ok` 和 `results` |
-| `401` | 签名缺失/错误/过期，或 nonce 重放 |
+| `401` | token 缺失/错误 |
 | `403` | 来源 IP 不在白名单 |
 | `404` | 没有路由匹配到（检查 `routes` 是否漏了 `source: "*"` 兜底） |
 | `429` | 该来源超过 `per_source_per_minute` |
@@ -157,38 +133,17 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 | HTTP 429 / 5xx / 网络异常 | 可重试 | 退避重试 |
 | QQ `code=100001`（频控） | 可重试 | 退避重试 |
 | QQ `code=100007/100016/10004` | 不可重试 | 直接死信 |
-| QQ 内容违规（`40034006` / `304061`） | 不可重试 | 直接死信，保留原文供人工改写 |
 | QQ HTTP 200 但 `code != 0` | 按 code 判定 | 同上 |
 | 通用 webhook `code/errcode != 0` | 按业务码判定 | 同上 |
 
 `?wait=1` 的同步路径在超时时（默认 5s，`dispatch.sync_timeout`）仍返回已知的部分结果。
-
-## QQ 消息审核与合规要点
-
-官方没有逐条人工审消息，「审核」分三层（来源：[消息收发概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)、[运营规范](https://bot.q.qq.com/wiki/business/)、[常见问题](https://bot.q.qq.com/wiki/bot_FAQ/)）：
-
-**发送方向（机器人→用户）**：平台实时自动审，先审后发。
-
-| 机制 | 表现 |
-|---|---|
-| 内容安全自动审 | 违规内容发送接口当场拒绝：`40034006 消息内容违规`、`304061 消息内容无效` |
-| 频道主动消息审核 | 异步 `MESSAGE_AUDIT` 事件（Intents 订阅）返回 MessageAudited 结果 |
-| 用户侧开关 | 用户可关闭「允许主动发送」，关闭后主动消息一律失败（`40054013 用户拒收消息`） |
-| 事后举报与处罚 | 用户可聊天界面举报机器人消息；AI 生成内容责任也在开发者，违规直至封搜索/封添加/下架/封号 |
-
-对网关的含义：内容违规类错误（`40034006`/`304061`）重试无意义，落死信保留原文供改写；频控类才值得退避重试（见「投递语义」）。
-
-**接收方向（用户→机器人）**：平台不二次审，合规责任在开发者。
-
-- 运营规范 §5.1/§8 硬性要求自建 UGC 过滤机制（建议调用官方「内容安全检测接口」校验文本/图片），被投诉须及时响应。
-- §11 数据安全：归档的用户数据不得外泄/挪用，用户要求即删，停止服务 24 小时内删除——chatdownload 归档适用同一条。
 
 ## 配置
 
 见 `config.example.yaml`。要点：
 
 - `routes` **按顺序匹配，第一条命中即生效**，务必把 `source: "*"` 放最后兜底。
-- `source` 来自**命中密钥的 source 归属**（`keys.conf` 行上的 `source=`），按密钥区分调用方，不要共用密钥。
+- `source` 来自 **`X-Source` 头**（不是 body），配合共享 Token 用；不可信的调用方不要给它伪造 source 的机会，或用不同 Token 区分。
 - `dedup` 按 `(source, level, title)` 在窗口内只发一次。**QQ 配额下这不是优化项而是必需项**。
 - `limits.per_target_per_minute` 建议不超过 QQ 侧配额（未认证群 30/min）。
 - 每个 target 可单独 `rate_per_minute` 覆盖。
@@ -198,9 +153,9 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 | 接口 | 说明 |
 |---|---|
 | `GET /_health` | 各 target 连通性（**免鉴权**） |
-| `GET /_stats`（带签名） | 计数器 + 队列积压 + WS 连接状态 |
-| `GET /_receipt/{event_id}`（带签名） | 单条通知各 target 的投递回执 |
-| `GET /_failures`（带签名） | 死信列表（排查"到底丢没丢"） |
+| `GET /_stats?token=` | 计数器 + 队列积压 + WS 连接状态 |
+| `GET /_receipt/{event_id}?token=` | 单条通知各 target 的投递回执 |
+| `GET /_failures?token=` | 死信列表（排查"到底丢没丢"） |
 
 `/_stats` 返回的 `targets.<id>.connections` 会显示每条出站 WS 的 `state` / `sent` / `uptime_s`，可以确认连接池是否真的活着。
 
@@ -216,7 +171,8 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 
 ## 私聊消息归档（chatdownload）
 
-对标 nonebot_plugin_chatdownload：**复用 `qq` 段同一个机器人**（同一份 access_token 缓存），WS 长连接收 `C2C_MESSAGE_CREATE` 单聊消息，实时落盘：
+对标 nonebot_plugin_chatdownload。**本插件是纯订阅者**：WS 长连接由 `qqws` 插件独占，
+chatdownload 订阅其广播的 `C2C_MESSAGE_CREATE` 事件（同一份 access_token 缓存），实时落盘：
 
 | 产出 | 说明 |
 |---|---|
@@ -226,53 +182,129 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 | `quest/error.jsonl` | 下载失败记录（不重试，人工复查） |
 
 - 配置见 `config.example.yaml` 的 `chatdownload` 一节；白名单 `target_users` 填 **user_openid**（不是 QQ 号），空 = 归档全部单聊。
-- 按需求裁剪：**不补历史、不做去重、不回消息**（收到消息不回复任何内容）。
-- 归档器随 app 启停，状态见 `/_health` 与 `/_stats` 的 `chatdownload` 段（received/archived 计数可用于监控丢消息）。
+- 归档器本身不回消息；白名单用户的文本消息在落盘后会进框架指令总线（前缀 `#`/`/`/`@`/`＠`），由注册了指令的插件（如 reminders）认领并经调度器投递回复。
+- 归档器随 app 启停，状态见 `/_health` 与 `/_stats` 的 `chatdownload` 段；连接状态在 `qqws` 段（state/session/received/uptime）。
 
 **硬限制（QQ 开放平台无对应 API）**：没有历史消息补抓——离线/重启期间消息永久丢失；没有合并转发展开（`get_forward_msg` 等价物不存在）。
+
+## 插件机制
+
+功能按插件组织在 `noti_gateway/plugins/`（一个功能一个模块，`_` 开头为内部助手），
+**连接与业务分层**（机制借鉴 NoneBot / Koishi / AstrBot，全程无 AI）：
+
+- **`qqws`** 独占 QQ 官方 WS 长连接（一个 appid 只有一条事件流，必须收口）：
+  连接/心跳/重连/Resume，收到 dispatch 事件后广播给 `ctx.event_listeners`，
+  并登记 msg_id 供**被动回复**；
+- **其他插件都是纯消费者**：chatdownload 订阅事件做归档；reminders 等用
+  **声明式指令**做交互——彼此互不感知、可插拔；
+- **声明式指令（学 Koishi）**：`ctx.command("提醒", hint="<时间> <内容>",
+  usage=_HELP, handler=fn)`——按「前缀后第一个词」匹配，回复由框架统一发送；
+  `#<指令> 帮助` 或空参数自动回 usage；**`#帮助` 总览由框架按已注册指令自动生成**，
+  帮助文本只写一份；priority 控制同名冲突；
+- **通知中间件（学 AstrBot pipeline）**：`ctx.notification_middleware` 在 submit 入队前
+  依次改写/丢弃通知（agents 插件：静默时段、per-source 模板、来源统计）；
+- **多轮会话（学 NoneBot got）**：`ctx.sessions.open(openid, handler)`——指令开启会话后，
+  用户下一条消息（**无需前缀**）交给会话处理器，返回 `Pending("下一个问题")` 继续追问，
+  「算了/取消」退出，5 分钟超时失效；
+- **定时任务服务（学 NoneBot APScheduler）**：`ctx.schedule(name, fn, cron=... 或 interval=...)`，
+  框架统一调度，插件不自己开循环；
+- **被动回复（QQ 平台机制）**：收到用户消息后 4 分钟内的回复自动带 `msg_id/msg_seq`
+  （同一条消息最多 5 条），**不占主动消息配额**；超窗自动降级主动消息；
+- 插件元信息：模块暴露 `META = PluginMeta(name, desc, version)`，`#插件` 指令与
+  `/_stats` 的 `plugins` 段展示；框架自带 `#状态`（运行摘要）与 `#插件` 指令；
+- 插件不直连 QQ 发送 API：一律走 `Dispatcher.submit` 进持久化队列，复用路由/限流/重试/回执；
+- 启用清单 `config.yaml` 的 `plugins`，缺省 `["qqws", "chatdownload", "reminders", "agents"]`
+  （顺序即事件分发顺序：归档先于指令；webchat 面板为可选加载）。
+
+## 网页消息面板（webchat 插件）
+
+网页版 QQ 风格消息面板（迁移自 bison2 的 nonebot_plugin_webchat）：
+
+- **实时查看** bot 收发的全部单聊消息：进站挂 `qqws` 事件广播，出站经
+  `targets.register_send_observer` 记录全部 QQ 投递（告警/提醒/面板手动发送都能看到）；
+  WebSocket 实时推送，每会话内存保留最近 N 条，jsonl 落盘重启恢复；
+- **手动发送**：面板以 bot 身份发文本/图片/文件；被动回复自动带 `msg_id/msg_seq`
+  （不占主动配额，窗口外自动降级主动）；媒体复用 targets 分块上传通道；
+- **图片代理**：消息内 QQ CDN 图由服务端无 Referer 回源中转，不受 rkey 时效与防盗链影响；
+- **安全**：TOTP 动态码登录签发 HMAC 会话令牌（重启不失效）、同源校验挡 CSRF、
+  登录限速防爆破、图片域名白名单防 SSRF。
+
+访问 `http://<host>:<port>/webchat/`，用验证器 App 的 TOTP 动态码登录。
+`webchat.totp_secret` 留空时自动生成并持久到 `webchat/webchat_totp_secret.txt`（启动日志打印一次）；
+面板数据目录 `webchat/`（messages.jsonl + 密钥文件）**已列入 .gitignore，不入库**。
+
+```yaml
+# config.yaml：plugins 清单加 "webchat"，再加如下段落
+webchat:
+  enabled: true
+  totp_secret: ""          # 留空自动生成（绑定验证器用）
+  session_days: 7          # 会话令牌有效期（天）
+  max_per_chat: 300        # 每会话内存保留条数
+  persist: true            # jsonl 落盘
+  data_dir: "webchat"      # 落盘目录（相对运行目录）
+```
+
+限制：仅单聊（qqws 当前只订阅 C2C）；图片+说明文字拆成「图+文」两条消息；视频/音频按文件发送。
+
+## 定时提醒（reminders 插件）
+
+一次性 / 每天 / 每周(多天) / 工作日 / 周末 / 每月 / 每年 / 间隔 / cron 提醒，**手机 QQ 发指令（前缀 `#`，`/` `@` `＠` 等价）或 HTTP API 都行**：
+
+```
+#提醒 30分钟后 喝水                一次性（也认 半小时后 / 10s / 5m / 2小时 / 3天 / in 5min）
+#提醒 18:00 下班打卡               今天没过用今天，过了自动算明天
+#提醒 下午3点 起来活动             时段限定词（凌晨/早上/上午/中午/下午/傍晚/晚上/深夜…；也认 九点十五 / 9点15 / 9点半）
+#提醒 明天 09:00 起床              也认 大后天 / 下周一 / 下下周三
+#提醒 周三 09:00 交周报            下一个周三（也认 星期五 18:00）
+#提醒 2026-11-20 09:00 交报告      完整日期，24 小时制
+#提醒 26年11月15日 09:00 交周报    中文日期（两位年）；省略年份写 11月15日 09:00
+#提醒 1115 09:00 交周报            紧凑日期（MMDD；261115=YYMMDD、20261115=YYYYMMDD）
+#提醒 每天 09:00 吃药              每日重复
+#提醒 每周一三五 10:00 站会        每周多天（也认 每周一至周五 / 每周六、日）
+#提醒 周末 10:00 大扫除            周六+周日
+#提醒 工作日 09:00 站会            周一至周五
+#提醒 每月1号 09:00 交房租         每月重复（也认 每月1、15号 / 每月最后一天）
+#提醒 每年11月20日 09:00 续费      每年重复
+#提醒 每30分钟 喝水                间隔重复（也认 每小时 / 每小时30分 / 每隔2小时 / 每3天 09:00 / 每季度 / 每半年）
+#提醒 0 9 * * * 背单词             cron（分 时 日 月 周，日字段支持 L=月末）
+#提醒 列表 ｜ #提醒 取消 12 ｜ #提醒 帮助
+```
+
+`#帮助`（help/? 同义）是**框架级指令总览**，由框架按已注册指令自动生成（含框架自带的 `#状态`/`#插件`）；`#<指令名> 帮助` 或空参数回该指令的用法详情。
+
+每条命令都会收到确认回复（含解析出的规则与下次触发时间，看一眼即可发现理解偏差）。
+
+HTTP API（HMAC 鉴权同其它端点）：
+
+```bash
+POST   /schedule          {"title": "...", "body": "...", "when": "每天 09:00"}
+                          when 语法同 QQ 命令；也可用 "at": ISO8601/epoch 或 "cron": "0 9 * * *"
+GET    /schedule?state=active    列表（state: active|done|cancelled|missed|all）
+DELETE /schedule/{id}            取消
+```
+
+投递语义：
+
+- 到点经 `Dispatcher.submit` 进持久化队列，复用路由/限流/重试/回执；**崩溃最多重复一次、不丢提醒**（at-least-once）；
+- 提醒是用户主动创建的离散事件，提交时绕过去重窗口（`dedup=False`）；
+- **错过补发**：停机跨过触发点，重启后 `reminders.grace_seconds`（默认 900s）内补发并在正文注明原定时间；更久远的一次性提醒转 `missed`，重复提醒跳过错过的次数直接算下一次；
+- 时间统一东八区，不依赖服务器系统时区；cron 为 5 段常用子集（`*/步长`、列表、区间、日与周「或」语义），由内置 120 行引擎解析，无新依赖；
+- 事件进 SSE：`GET /stream?types=reminder` 可订阅 fired/missed/error。
 
 ## 已知边界
 
 - **单机单实例**设计。队列是本地 SQLite，多副本部署需要换 Redis。
 - 关闭时会排空队列（`TimeoutStopSec` 要给够时间），但排空超时后未发完的会留在 SQLite 里，下次启动自动恢复。
 - QQ **频道（子频道）** 场景官方要求机器人保持 WebSocket 在线。单聊收消息已由 chatdownload 实现（Gateway 收事件）；群聊 @机器人 消息、按钮交互、频道消息仍未接。
-- 鉴权为 HMAC 多密钥（`keys.conf`，`kind=hmac` 行），密钥即来源身份，按客户端分密钥即可隔离。
+- 鉴权为 HMAC 多密钥签名（`keys.conf` 实时生效）；来源 IP 白名单 `auth.ip_allow` 公网部署建议开启。
 
 ## 测试
 
 ```bash
-python tests/selftest.py          # 全链路 30 项：HMAC 鉴权/异步/同步/WS池/去重/路由/格式/回执
-python tests/test_auth.py         # 鉴权单元 22 项：HTTP/WS 签名、重放、strict_source、e2e
-python tests/test_retry.py        # 重试与死信语义 10 项
-python tests/test_connections.py  # 多客户端并发/心跳/批量/_wait/SSE 20 项
-python tests/test_config_bots.py  # 多机器人配置解析 19 项
+python tests/selftest.py          # 全链路 25 项：鉴权/异步/同步/WS池/去重/路由/格式/回执
+python tests/test_retry.py        # 重试与死信语义 9 项
+python tests/test_connections.py  # 多客户端并发/心跳/批量/_wait/SSE 22 项
+python tests/test_reminders.py    # 定时提醒 58 项：解析/cron/HTTP全链路/命令/错过补发
 ```
 
-三个测试都自带 mock 服务，不需要真实 QQ 凭证、不需要联网。
-
-## 许可协议
-
-本仓库 **noti-gateway 本体**（`noti_gateway/`、`deploy/`、`tests/`、文档等）采用
-[GNU AGPL v3.0 or later](LICENSE) 授权：
-
-```
-Copyright (C) 2026 zlqd123
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as
-published by the Free Software Foundation, either version 3 of the
-License, or (at your option) any later version.
-```
-
-即 **AGPL-3.0-or-later**。允许商用、修改、分发；但分发、或通过网络向用户提供本软件
-（含修改版）的服务时，必须向用户提供对应完整源码，且衍生作品同样按 AGPL 开源。
-
-例外（保留各自原许可证，与仓库根 LICENSE 并存）：
-
-- `platform/dsh/`：[`dsh-notifier-gate`](https://github.com/zlqd123/dsh-notifier-gate)
-  的接入副本，核心逻辑来自 [`dsh-notifier`](https://github.com/THEWOLFWALKER/dsh-notifier)
-  （MIT），整体维持 **MIT**——版权声明与许可全文见 `platform/dsh/LICENSE`、
-  `platform/dsh/THIRD_PARTY_NOTICES.md`。
-- `platform/opencode/`：节点检测架构复刻自
-  [opencode-notifier](https://github.com/mohak34/opencode-notifier)（MIT），
-  未移植任何代码，仅在此致谢。
+四个测试都自带 mock 服务，不需要真实 QQ 凭证、不需要联网。
