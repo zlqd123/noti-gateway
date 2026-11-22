@@ -107,7 +107,7 @@ export function normalizeAgentLifecyclePayload(payload) {
  * counts failed registration attempts, not a final failed state: a current
  * throw followed by a root success reports attempts=1, registered=1, failures=1.)
  */
-export function createHostEventRegistrar(ctx, warn = () => {}, now = Date.now) {
+export function createHostEventRegistrar(ctx, warn = () => {}, now = Date.now, info = () => {}) {
   const contexts = hostEventContexts(ctx)
   let activeTarget = contexts.current ?? contexts.root ?? {
     ctx,
@@ -125,6 +125,10 @@ export function createHostEventRegistrar(ctx, warn = () => {}, now = Date.now) {
   }
   const report = (message) => {
     try { warn(message) } catch { /* diagnostics must not affect startup */ }
+  }
+  // 常规订阅成功属正常生命周期：只进 logger，不刷控制台（失败仍走 report/warn）。
+  const reportInfo = (message) => {
+    try { info(message) } catch { /* diagnostics must not affect startup */ }
   }
 
   const subscribe = (candidate, event, wrapped, row) => {
@@ -146,7 +150,7 @@ export function createHostEventRegistrar(ctx, warn = () => {}, now = Date.now) {
       // checks"; dsh-im subscribes to `session/event` the same way.
       const disposer = candidate.ctx.on(event, wrapped, { global: true })
       row.registered = increment(row.registered)
-      report(`宿主事件订阅已注册: ${event}（context=${candidate.source}，scope=${candidate.scope}，global=true）`)
+      reportInfo(`宿主事件订阅已注册: ${event}（context=${candidate.source}，scope=${candidate.scope}，global=true）`)
       return { ok: true, disposer: typeof disposer === 'function' ? disposer : undefined }
     } catch (error) {
       row.failures = increment(row.failures)

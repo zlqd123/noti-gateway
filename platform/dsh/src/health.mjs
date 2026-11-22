@@ -44,7 +44,7 @@ export async function runChannelTest({ type, rawConfig, message, strings = null 
     const publicText = diagnosticErrorMessage(error instanceof Error ? (error.publicMessage ?? error.message) : error, resolved)
     const internalDetail = diagnosticErrorMessage(error.detail ?? error, resolved)
     try {
-      console.error(`[dsh-notifier-qq/health] 渠道 "${channel}" 自检失败详情: ${internalDetail}`)
+      console.error(`[dsh-notifier-gate/health] 渠道 "${channel}" 自检失败详情: ${internalDetail}`)
     } catch { /* stderr 不可用不致命 */ }
     return { ok: false, channel, detail: `发送失败：${publicText}` }
   }

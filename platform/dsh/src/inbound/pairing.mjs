@@ -14,6 +14,7 @@
 // 码级 locked 态保留，由管理台显式锁定（可疑活动人工处置）触达。
 
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createLog } from '../log.mjs'
 import { bindingKey, principalKey } from './identity.mjs'
 import { setDurable, transactDurable } from './store.mjs'
 
@@ -82,10 +83,9 @@ export function createPairing(options = {}) {
   // 内存态（store=null 时唯一真相；有 store 时用于无盘测试与降级）
   let memoryCodes = {}
   let memoryLockout = {}
-  const warn = (message) => {
-    try { options.logger?.warn?.('[dsh-notifier-qq/pairing]', message) } catch { /* 日志失败绝不致命 */ }
-    try { console.error('[dsh-notifier-qq/pairing]', message) } catch { /* 控制台不可用不致命 */ }
-  }
+  const log = createLog({ logger: options.logger, tag: '[dsh-notifier-gate/pairing]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
 
   /** 读全部码条目（读盘防御：坏形状整条丢弃）。 */
   function readCodes() {

@@ -1,4 +1,5 @@
 import { stringsOf } from '../strings.mjs'
+import { createLog } from '../log.mjs'
 // dsh-notifier v0.7 inbound/commands.mjs
 // 注册面命令（v0.7 计划书 §3.2/§3.3）：/help /whoami /pair /unpair。
 // 命名决议（评审发现）：会话路由已有 /bind /unbind（conversation.mjs，绑定 agent 会话），
@@ -125,10 +126,9 @@ export function createCommandHandler(options = {}, strings) {
   const t = strings ?? ZH_FALLBACK
   const identity = options.identity
   const pairing = options.pairing
-  const warn = (message) => {
-    try { options.logger?.warn?.('[dsh-notifier-qq/commands]', message) } catch { /* 日志失败绝不致命 */ }
-    try { console.error('[dsh-notifier-qq/commands]', message) } catch { /* 控制台不可用不致命 */ }
-  }
+  const log = createLog({ logger: options.logger, tag: '[dsh-notifier-gate/commands]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
 
   /** 引导码过期后按需重铸（引导态自愈：用户 10 分钟后才来也不必重启宿主）。
    *  v0.8.7 (A4)：节流 10 分钟 + mint 失败不假断言 + 回调异常不静默。 */
@@ -156,9 +156,7 @@ export function createCommandHandler(options = {}, strings) {
   const whoamiText = (envelope, bound) => {
     const head = t.commands.whoamiHead(getChannelName(envelope.channel, strings), envelope.userId)
     if (!bound) return t.commands.whoamiUnbound(head)
-    const accountId = String(envelope.accountId ?? 'default').trim() || 'default'
-    const record = identity.list(envelope.channel).find((item) => String(item.userId) === String(envelope.userId)
-      && String(item.accountId ?? 'default') === accountId)
+    const record = identity.find(envelope.channel, envelope.userId, envelope.accountId)
     const label = record !== undefined && record.label !== '' ? t.commands.labelSuffix(record.label) : ''
     return t.commands.whoamiBound(head, label, record?.role ?? 'member')
   }
@@ -240,9 +238,7 @@ export function createCommandHandler(options = {}, strings) {
       return t.commands.unpairNotBound
     }
     if (identity.ownerCount() <= 1) {
-      const accountId = String(envelope.accountId ?? 'default').trim() || 'default'
-      const record = identity.list(envelope.channel).find((item) => String(item.userId) === String(envelope.userId)
-        && String(item.accountId ?? 'default') === accountId)
+      const record = identity.find(envelope.channel, envelope.userId, envelope.accountId)
       if (record?.role === 'owner') {
         return t.commands.unpairLastOwner
       }

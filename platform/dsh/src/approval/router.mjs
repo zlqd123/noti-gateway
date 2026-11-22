@@ -86,7 +86,7 @@ export function registerApprovalHandler(deps, strings) {
   // 下对密钥形态打码——不影响裁决所需信息（看到 sk-*** 足以判断，无需真实密钥值）。
   const redaction = normalizeRedaction(deps.redaction)
   const warn = (message) => {
-    try { deps.logger?.warn?.('[dsh-notifier-qq/approval]', message) } catch { /* 日志失败绝不致命 */ }
+    try { deps.logger?.warn?.('[dsh-notifier-gate/approval]', message) } catch { /* 日志失败绝不致命 */ }
   }
 
   // 升级链：主推送无人响应时按 stages 节奏再提醒（answer 模式下与 wait 并行）
@@ -391,13 +391,24 @@ export function registerApprovalHandler(deps, strings) {
     if (textChannels.length > 0) channelNotes.push(t.approval.sentNoticeNote(textChannels))
     const outbound = new Set(Array.isArray(notifier?.channels) ? notifier.channels : [])
     const carded = new Set(pushedTo.map((target) => String(target.channel)))
-    const broadcastTypes = channelTypes === null
-      ? null
-      : channelTypes.filter((type) => {
-        const alias = toInboundChannelName(String(type))
-        return alias === type || !carded.has(alias)
-      }).filter((type) => outbound.size === 0 || outbound.has(type))
-    if (broadcastTypes !== null && broadcastTypes.length === 0) return { pushedTo, hintTargets }
+    // 已通过「逐目标文字兜底」送达的渠道同样算「本事件已通知过」：
+    // 卡片失败分支会先 sendText 到同一 chat，此时若再走广播就是同一次审批双响。
+    const texted = new Set(hintTargets.map((target) => String(target.channel)))
+    // 卡片/兜底文字已送达的渠道不再补发同事件的纯文字通知（「不要重复发」）。
+    // 关键：channelTypes === null 是**全局广播**（不分流），旧实现此分支直接
+    // broadcastTypes = null → 完全跳过过滤 → 已拿到按钮卡片的 qq 又收一条
+    // 「回复 1 批准」文字，同一次审批双响。现在广播也按同一规则剔除已覆盖渠道：
+    // 出站 type 经别名归一后若已在 carded/texted（qq-bot → qq），就不再走文字线。
+    const covered = (type) => {
+      const channel = toInboundChannelName(String(type))
+      return carded.has(channel) || texted.has(channel)
+    }
+    const broadcastTypes = (channelTypes === null
+      ? (Array.isArray(notifier?.channels) ? notifier.channels : [...outbound])
+      : channelTypes
+    ).filter((type) => !covered(type)).filter((type) => outbound.size === 0 || outbound.has(type))
+    // 空集 = 全部目标已被卡片或兜底文字覆盖 → 不补任何文字（早退，避免 notifyAll 空转）。
+    if (broadcastTypes.length === 0) return { pushedTo, hintTargets }
     // G-34（D5）：早到的裁决（waiter 预注册窗口内用户已点卡）已把行翻终态——广播文本
     // 此时只会造成"已批卡片 + 还在等待批准"双响，直接抑制。
     if (textLineSuppressed(key)) return { pushedTo, hintTargets }
@@ -592,6 +603,7 @@ export function registerApprovalHandler(deps, strings) {
       }
       const delivery = await pushApproval(key, token, request, channelTypes, targetsByChannel)
       const pushedTo = delivery.pushedTo
+      const hintTargets = delivery.hintTargets
       const row = ledger.get(key)
       if (row !== undefined && row.status === 'pending') {
         if (setDurable(store, key, { ...row, pushedTo, hintTargets: delivery.hintTargets }) !== true) {
@@ -642,11 +654,23 @@ export function registerApprovalHandler(deps, strings) {
         // G-34（D5）：升级链文本同样受 5min 抑制——卡片已裁决的审批不再"仍在等待批准"
         // （escalation.stop 在裁决后调用，这里兜住 stop 前的已触发 stage 竞态）。
         if (textLineSuppressed(key)) return
+        // 「仅保留卡片」：卡片已经送达的渠道不再收升级提醒纯文字——那张卡本身就在那里，
+        // 用户点一下就完事，再推一条「仍在等待批准」是同一次审批的第二条消息。
+        // 只给没有卡片可点的渠道（群聊降级/卡片发送失败）保留提醒文字。
+        const reminderTypes = (channelTypes === null
+          ? (Array.isArray(notifier?.channels) ? notifier.channels : [])
+          : channelTypes
+        ).filter((type) => {
+          const channel = toInboundChannelName(String(type))
+          return !pushedTo.some((target) => String(target.channel) === channel)
+            && !hintTargets.some((target) => String(target.channel) === channel)
+        })
+        if (reminderTypes.length === 0) return
         notifier.notifyAll({
           title: t.approval.escStillWaiting(request?.toolName),
           content: t.approval.escContent(stage.note ?? t.approval.escNoteFallback, Math.round((Date.now() - startedAt) / 1000), cardChannelNames),
           level: stage.level ?? 'timeSensitive',
-        }, channelTypes !== null ? { channelTypes } : {}).catch(() => {})
+        }, { channelTypes: reminderTypes }).catch(() => {})
       })
 
       const decision = await decisionPromise

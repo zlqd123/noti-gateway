@@ -79,7 +79,7 @@ async function cancelResponse(response) {
 }
 
 function warnAttachmentBudget(message) {
-  try { console.warn(`[dsh-notifier-qq/inbound/message] ${message}`) } catch { /* 日志失败不致命 */ }
+  try { console.warn(`[dsh-notifier-gate/inbound/message] ${message}`) } catch { /* 日志失败不致命 */ }
 }
 
 /** url 精确必须是非空字符串（fail-closed：缺 URL 的附件段不构成有效媒体消息）。 */

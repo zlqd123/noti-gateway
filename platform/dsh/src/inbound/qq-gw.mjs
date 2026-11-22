@@ -3,6 +3,11 @@
 // 背景：QQ 官方 Node SDK（bot-node-sdk → qq-guild-bot）改名两次后事实弃维，
 // 活下去的是协议本身——WS 网关收事件 + REST 发消息 + getAppAccessToken 换 token，
 // 全是裸 HTTP/WS，原生 fetch + globalThis.WebSocket（Node 22 内置）即可。
+// v0.14 统一网关模式（transport='gateway'，配置 gatewayUrl+gatewaySecret 启用）：
+//   入站事件源换成 noti-gateway 的 SSE（/stream?types=qq_event，HMAC v1 签名），
+//   出站发送换成 /n/{source} raw_qq 透传；QQ WS 协议层（HELLO/IDENTIFY/心跳/RESUME）
+//   与交互回应（PUT /interactions）全部由网关托管，本进程不再持有 QQ 凭证——
+//   零 QQ 直连。直连模式（transport='direct'）原样保留，未配网关时行为不变。
 //  - 事件：C2C_MESSAGE_CREATE（单聊）/ GROUP_AT_MESSAGE_CREATE（群 @，仅被 @ 时投递）
 //  - 网关协议：op10 HELLO → op2 IDENTIFY（或 op6 RESUME）→ op1/op11 心跳；
 //    op0 DISPATCH 携带 s 序号（心跳带回）；op7 RECONNECT / op9 INVALID_SESSION 走重连
@@ -17,6 +22,7 @@
 // 频控：Bot 维度 60qpm ≈ 1 条/秒（复用出站 qq-bot 的限速门经验值）；被动回复
 // （带 msg_id 关联事件）有独立配额，5 条内免主动消息权限。
 
+import { createHmac, createHash, randomBytes } from 'node:crypto'
 import { createTokenManager, createRateGate, normalizeTtlMs } from '../adapters/_tokens.mjs'
 import { setBounded, createThrottledWarn } from './_bounded.mjs'
 import { resolveNotifyTargets } from './target-guard.mjs'
@@ -24,6 +30,7 @@ import { buildApprovalAction, parseApprovalAction, buildQuestionAction, parseQue
 import { parseQQImageMessage, parseQqAttachments } from './message.mjs'
 import { splitByCodePoints } from './segment.mjs'
 import { stringsOf } from '../strings.mjs'
+import { createLog } from '../log.mjs'
 
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken'
 const DEFAULT_API_BASE = 'https://api.sgroup.qq.com'
@@ -41,10 +48,13 @@ const QQ_MARKDOWN_MAX_CODEPOINTS = 3000
  *  超限时平台静默丢弃（无错误码、无回执）——本侧不硬阻塞投递（硬阻塞把「可能仍送达」
  *  变成「必然不送达」），仅 warn 出声让丢弃可见。主动消息（无 msg_id）不受此配额约束。 */
 const QQ_PASSIVE_REPLY_QUOTA = { user: 4, group: 5 }
-/** #26 对齐腾讯 dsh-qqbot 参考实现（`src/features/button-utils.ts` 的 BUTTON_LABEL_MAX=10）：
- *  QQ keyboard 按钮 label 上限 ≤10 码点。按码点截断（不用 .length 的 UTF-16 语义——
- *  emoji/星体字符按码元切会把代理项劈成两半，G-22 同根），超长取前 9 码点补省略号。 */
-const QQ_BUTTON_LABEL_MAX_CODEPOINTS = 10
+/** QQ keyboard 按钮 label 上限 = **15 码点**（实测值，非参考实现取值）。
+ *  原实现沿用腾讯 dsh-qqbot 参考实现的 BUTTON_LABEL_MAX=10，比平台真实上限保守 5 个字符，
+ *  导致 11~15 字的选项被提前截成「1. 一次性验证…」。2026-10-28 实测：向平台直接发送
+ *  10/15/20/30 字的 label，15 字完整显示、20 字起被省略号截断，故取 15。
+ *  按码点截断（不用 .length 的 UTF-16 语义——emoji/星体字符按码元切会把代理项劈成
+ *  两半，G-22 同根），超长取前 14 码点补省略号。 */
+const QQ_BUTTON_LABEL_MAX_CODEPOINTS = 15
 
 // WS op codes（QQ 网关协议）
 const OP_DISPATCH = 0
@@ -71,8 +81,19 @@ export function resolveQqInboundConfig(raw, options = {}) {
   const creds = (options.credentials !== null && typeof options.credentials === 'object') ? options.credentials : {}
   const appId = String(cfg.appId ?? creds.appId ?? '').trim()
   const appSecret = String(cfg.appSecret ?? creds.appSecret ?? '').trim()
-  if (appId === '' || appSecret === '') {
-    return { ok: false, reason: `QQ inbound 需要 appId 与 appSecret（当前 appId ${appId !== '' ? '已配置' : '缺失'}，appSecret ${appSecret !== '' ? '已配置' : '缺失'}）。请在 QQ 开放平台 q.qq.com 机器人开发设置中获取，或执行 node scripts/channel-login.mjs qq 官方扫码自动写入` }
+  // v0.14 统一网关模式：配置 gatewayUrl + gatewaySecret 即经 noti-gateway 接入
+  // （入站 = 网关 SSE /stream?types=qq_event，出站 = /n/{source} raw_qq 透传）。
+  // QQ WS 协议层（HELLO/IDENTIFY/心跳/RESUME/交互回应）由网关托管，本进程不再
+  // 需要 appId/appSecret——QQ 凭证只存在于网关侧（keys.conf/config.yaml）。
+  const gatewayUrl = String(cfg.gatewayUrl ?? '').trim().replace(/\/+$/, '')
+  const gatewaySecret = String(cfg.gatewaySecret ?? '').trim()
+  const gatewaySource = String(cfg.gatewaySource ?? '').trim() || 'dsh'
+  const gatewayKeyId = String(cfg.gatewayKeyId ?? '').trim() || (gatewaySecret !== '' ? gatewaySource : '')
+  const isGateway = gatewayUrl !== '' && gatewaySecret !== ''
+  if (!isGateway) {
+    if (appId === '' || appSecret === '') {
+      return { ok: false, reason: `QQ inbound 需要 gatewayUrl+gatewaySecret（统一网关模式，当前 gatewayUrl ${gatewayUrl !== '' ? '已配置' : '缺失'}，gatewaySecret ${gatewaySecret !== '' ? '已配置' : '缺失'}），或 appId+appSecret（直连模式，当前 appId ${appId !== '' ? '已配置' : '缺失'}，appSecret ${appSecret !== '' ? '已配置' : '缺失'}）` }
+    }
   }
   const notifyUsers = (Array.isArray(cfg.notifyUsers) ? cfg.notifyUsers : []).map((id) => String(id).trim()).filter((id) => id !== '')
   const notifyGroups = (Array.isArray(cfg.notifyGroups) ? cfg.notifyGroups : []).map((id) => String(id).trim()).filter((id) => id !== '')
@@ -80,6 +101,12 @@ export function resolveQqInboundConfig(raw, options = {}) {
   return {
     ok: true,
     config: {
+      // transport: 'gateway'（统一网关）| 'direct'（QQ WS 直连，legacy 保留）
+      transport: isGateway ? 'gateway' : 'direct',
+      gatewayUrl,
+      gatewaySecret,
+      gatewayKeyId,
+      gatewaySource,
       appId,
       appSecret,
       apiBase: (String(cfg.apiBase ?? '').trim() || DEFAULT_API_BASE).replace(/\/+$/, ''),
@@ -200,18 +227,37 @@ export function createQqInbound(options = {}) {
   const ackThreshold = Number(options.maxMissedAcks)
   const maxMissedAcks = Number.isFinite(ackThreshold) && ackThreshold >= 1 ? Math.min(10, Math.floor(ackThreshold)) : 2
 
-  const warn = (message) => {
-    try { logger?.warn?.('[dsh-notifier-qq/inbound:qq]', message) } catch { /* 日志失败绝不致命 */ }
-    // v0.6.1 双写 stderr：宿主 logger 不落 stdout 时轮询/装配告警仍可见（真机事故复盘）
-    try { console.error('[dsh-notifier-qq/inbound:qq]', message) } catch { /* 控制台不可用不致命 */ }
+  // v0.14 统一网关模式（transport==='gateway'）：事件源换成 noti-gateway SSE
+  // （/stream?types=qq_event，HMAC v1 签名），发送走 /n/{source} raw_qq 透传——
+  // payload 即 QQ 消息 API 的 body（msg_type/content/markdown/keyboard/msg_seq/msg_id），
+  // scene（user/group）由网关 target 配置决定。直连模式（transport==='direct'）行为不变。
+  const GATEWAY = String(config?.transport ?? '') === 'gateway'
+  const gwUrl = String(config?.gatewayUrl ?? '').replace(/\/+$/, '')
+  const gwSecret = String(config?.gatewaySecret ?? '')
+  const gwKeyId = String(config?.gatewayKeyId ?? '') || gwSourceFallback(config)
+  const gwSource = String(config?.gatewaySource ?? '') || 'dsh'
+  // SSE 载荷里带的 bot appid（网关广播 qq_event 时附上）；直连模式恒为空。
+  let sseBotId = ''
+  /** 信封 accountId：直连=appId；网关=SSE bot 字段（回落 gatewaySource）。
+   *  绑定/配对按 userId 索引，accountId 仅作账号标注——单账号部署语义等价。 */
+  const accountIdOf = () => String(config?.appId ?? '') || sseBotId || gwSource
+  function gwSourceFallback(cfg) {
+    return String(cfg?.gatewaySource ?? '') || 'dsh'
   }
-  // debug 级诊断只走宿主 logger（不双写 stderr）：@ 形态采样这类低频诊断由宿主按需开启，
-  // 避免 stderr 噪音；宿主未接 debug 时静默跳过（fail-safe，不影响主路径）。
-  const debug = (message) => {
-    try { logger?.debug?.('[dsh-notifier-qq/inbound:qq]', message) } catch { /* 日志失败绝不致命 */ }
-  }
+
+  // 统一日志出口：故障(warn/error)双写可见；连接生命周期(info)只进 logger，
+  // 不再让「已就绪 / 断线恢复 / 会话轮转」每次重连都刷控制台。
+  const log = createLog({ logger, tag: '[dsh-notifier-gate/inbound:qq]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
+  const debug = (message) => log.debug(message)
   const evictionWarn = createThrottledWarn(warn, { intervalMs: 1000 })
   const onEvict = (key) => evictionWarn((count) => `目标类型学习表达上限：淘汰 ${count} 个旧目标（最近淘汰 ${String(key).slice(0, 32)}）`)
+
+  // 连接生命周期计数（日志降噪用）：4009/op7 这类"平台侧正常会话轮转"在稳态下会周期性
+  // 出现，只让首次出声，之后降为 debug，避免日志被「已就绪/闭码」刷成看起来像故障。
+  let sessionRotationCount = 0
+  let readyCount = 0
 
   // #31 入站 transport 有限超时：config.timeoutMs 此前仅解析从未注入——换 token/发消息/
   // 回执/卡片全走裸 fetchImpl（无 signal），宿主线程或网络卡死时这些调用可无限挂起。
@@ -229,6 +275,53 @@ export function createQqInbound(options = {}) {
         (response) => { clearTimeout(timer); return response },
         (error) => { clearTimeout(timer); throw error },
       )
+  }
+
+  // ---------- 统一网关模式：HMAC 签名 + raw_qq 发送 + SSE 事件源 ----------
+
+  /** HMAC v1 签名头（canonical = METHOD\nPATH\nTS\nNONCE\nSHA256(body)——网关接入文档 §3）。
+   *  签名 PATH 不含查询串（?wait=1 等只出现在 URL）。 */
+  function gatewaySignHeaders(method, path, bodyRaw) {
+    const ts = String(Math.floor(Date.now() / 1000))
+    const nonce = randomBytes(8).toString('hex')
+    const bodyHex = createHash('sha256').update(bodyRaw, 'utf8').digest('hex')
+    const canonical = [method, path, ts, nonce, bodyHex].join('\n')
+    const sig = 'v1=' + createHmac('sha256', gwSecret).update(canonical, 'utf8').digest('hex')
+    return {
+      'x-noti-signature': sig,
+      'x-noti-timestamp': ts,
+      'x-noti-nonce': nonce,
+      'x-noti-key-id': gwKeyId,
+    }
+  }
+
+  /** 从网关同步回执（{"ok":true,"results":{...,"detail":"msg_id=..."}}）提取 QQ msg_id。 */
+  function msgIdOfGatewayResult(result) {
+    try {
+      for (const value of Object.values(result?.results ?? {})) {
+        const m = /msg_id=([A-Za-z0-9_-]+)/.exec(String(value?.detail ?? ''))
+        if (m !== null && m[1] !== '') return m[1]
+      }
+    } catch { /* 回执形状未知不影响发送成功语义 */ }
+    return null
+  }
+
+  /** 经统一网关发送 raw_qq 透传载荷（body = QQ 消息 API body；成功返回网关回执对象）。 */
+  async function gwSendRawQq(body) {
+    if (fetchImpl === undefined) throw new Error('当前运行时无 fetch，QQ inbound 不可用')
+    const payload = JSON.stringify({ raw_qq: body })
+    const signPath = `/n/${encodeURIComponent(gwSource)}`
+    const response = await fetchWithTimeout(`${gwUrl}${signPath}?wait=1`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...gatewaySignHeaders('POST', signPath, payload) },
+      body: payload,
+    })
+    const result = await response.json().catch(() => null)
+    if (!response.ok || (result !== null && typeof result === 'object' ? result.ok !== true : true)) {
+      const detail = result === null ? '(响应非 JSON)' : JSON.stringify(result).slice(0, 300)
+      throw new Error(`网关 raw_qq 发送失败（HTTP ${response.status}）: ${detail}`)
+    }
+    return result ?? {}
   }
 
   // token 管理器（换 token → 缓存 → 提前刷新 → 失效作废），与出站 qq-bot 同一套逻辑
@@ -253,6 +346,7 @@ export function createQqInbound(options = {}) {
   let startPromise = null
   let stopRequested = false
   let ws = null
+  let sseAbort = null // 统一网关模式：SSE 读循环的 AbortController（stop 时中止）
   let heartbeatTimer = null
   let heartbeatIntervalMs = null
   let heartbeatArmed = false
@@ -306,6 +400,10 @@ export function createQqInbound(options = {}) {
       try { ws.close() } catch { /* 已关闭 */ }
       ws = null
     }
+    if (sseAbort !== null) {
+      try { sseAbort.abort() } catch { /* 已中止 */ }
+      sseAbort = null
+    }
   }
 
   function armHandshakeDeadline(phase, conn) {
@@ -344,7 +442,16 @@ export function createQqInbound(options = {}) {
       return
     }
     if (code === 4006 || code === 4007 || code === 4009) {
-      warn(`QQ 网关闭码 ${code}：会话不可恢复，弃会话重新 IDENTIFY`)
+      // 4009 是 QQ 平台侧的常规会话轮转（同账号多端登录/服务端换节点都会触发），
+      // 重连成功后一切正常。若每次都用 warn 打印「闭码 + 已就绪」两条，稳态下会
+      // 刷成日志噪音，看起来像插件在反复出错。这里改为：
+      //  - 只记一行，带累计次数；首次 warn 之后降为 debug（仍可在详细日志里查到）
+      //  - 「已就绪」那条同样只在首次连接时出声
+      // 真正需要关注的 4004/4008 仍然无条件 warn。
+      sessionRotationCount += 1
+      const note = `QQ 网关闭码 ${code}：会话不可恢复，弃会话重新 IDENTIFY（第 ${sessionRotationCount} 次会话轮转，属正常重连）`
+      if (sessionRotationCount === 1) warn(note)
+      else debug(note)
       sessionId = null
       lastSeq = null
       scheduleReconnect({ resume: false })
@@ -416,14 +523,18 @@ export function createQqInbound(options = {}) {
       clearHandshakeDeadline()
       reconnectAttempts = 0
       sessionId = String(d?.session_id ?? '') || null
-      warn(`QQ 网关已就绪（session ${sessionId ?? '?'}）`)
+      readyCount += 1
+      // 稳态下会话轮转会反复 READY：首次出声，之后降 debug（避免日志刷屏）
+      // 就绪属正常生命周期：info（只进 logger）；重复轮转降 debug。
+      if (readyCount === 1) info(`QQ 网关已就绪（session ${sessionId ?? '?'}）`)
+      else debug(`QQ 网关已就绪（session ${sessionId ?? '?'}，第 ${readyCount} 次）`)
       armHeartbeat() // Issue #23：鉴权完成（READY）后才幂等启动心跳，立即发首拍
       return
     }
     if (t === 'RESUMED') {
       clearHandshakeDeadline()
       reconnectAttempts = 0
-      warn('QQ 网关断线恢复（RESUME 成功，事件不丢）')
+      info('QQ 网关断线恢复（RESUME 成功，事件不丢）')
       armHeartbeat() // Issue #23：RESUMED 后同样起搏（幂等，避免重复 READY/RESUMED 建多定时器）
       return
     }
@@ -441,7 +552,7 @@ export function createQqInbound(options = {}) {
         // msg_id 必带（R5 审查 R5-3-P2-3：C2C 不带 msg_id 走主动消息额度，真机大概率被
         // 平台 4xx 拒掉——mock fetch 不校验被动回复权限，单测测不出；带 msg_id 走被动回复）
         const envelope = {
-          channel: 'qq', accountId: String(config?.appId ?? ''), userId, chatId: userId, messageId,
+          channel: 'qq', accountId: accountIdOf(), userId, chatId: userId, messageId,
           chatType: 'private',
           text: text || placeholderOf(attachments),
           ...attachmentFields(attachments, text === ''),
@@ -471,7 +582,7 @@ export function createQqInbound(options = {}) {
         setBounded(targetKinds, chatId, 'group', CHAT_STATE_MAX, onEvict)
         // v0.7：群聊拒绝回执发回群（含「请私聊发送 /pair」引导）
         const result = bus.accept({
-          channel: 'qq', accountId: String(config?.appId ?? ''), userId, chatId, messageId, chatType: 'group',
+          channel: 'qq', accountId: accountIdOf(), userId, chatId, messageId, chatType: 'group',
           text: text || placeholderOf(attachments),
           ...attachmentFields(attachments, text === ''),
         })
@@ -503,7 +614,7 @@ export function createQqInbound(options = {}) {
         const parsed = parseApprovalAction(buttonData)
         const question = parseQuestionAction(buttonData)
         if (question !== null) {
-          const result = bus.accept({ channel: 'qq', accountId: String(config?.appId ?? ''), userId, chatId, chatType, messageId: interactionId,
+          const result = bus.accept({ channel: 'qq', accountId: accountIdOf(), userId, chatId, chatType, messageId: interactionId,
             text: `[提问按钮:${question.optIdx}] ${question.qKey}`,
             questionAction: question })
           if (result?.reply !== undefined) postMessage(chatId, String(result.reply), interactionId).catch(() => {})
@@ -512,7 +623,7 @@ export function createQqInbound(options = {}) {
         if (parsed === null) return
         const result = bus.accept({
           channel: 'qq',
-          accountId: String(config?.appId ?? ''),
+          accountId: accountIdOf(),
           userId,
           chatId,
           chatType,
@@ -579,7 +690,9 @@ export function createQqInbound(options = {}) {
       return
     }
     if (frame.op === OP_RECONNECT) {
-      warn('服务端要求重连（op7）')
+      // op7 是平台常规的"换节点/主动要求重连"指令，稳态下会周期性出现，
+      // 不属于故障——降为 debug，避免与 4009 一起刷屏。
+      debug('服务端要求重连（op7）')
       cleanupSocket()
       scheduleReconnect({ resume: true })
       return
@@ -599,7 +712,59 @@ export function createQqInbound(options = {}) {
     }
   }
 
+  /** 统一网关模式事件源：SSE 订阅 /stream?types=qq_event（HMAC 签名），阻塞读循环。
+   *  断流/异常抛出，由 start() 的重连环按指数退避重连。事件负载
+   *  {"event","bot","data"} → handleDispatch(event, data)（与 QQ WS dispatch 同构）；
+   *  bot 字段记录为信封 accountId；交互回应由网关自动完成（本侧 ackInteraction 空转）。 */
+  async function connectSse() {
+    if (fetchImpl === undefined) throw new Error('当前运行时无 fetch，QQ inbound 不可用')
+    const controller = new AbortController()
+    sseAbort = controller
+    let response
+    try {
+      response = await fetchImpl(`${gwUrl}/stream?types=qq_event`, {
+        headers: { accept: 'text/event-stream', ...gatewaySignHeaders('GET', '/stream', '') },
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (stopRequested || controller.signal.aborted) return
+      throw error
+    }
+    if (response.status !== 200 || !response.body) {
+      throw new Error(`网关 SSE 订阅失败（HTTP ${response.status}）`)
+    }
+    info('统一网关 SSE 已连接（types=qq_event）')
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let eventType = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).replace(/\r$/, '')
+        buffer = buffer.slice(idx + 1)
+        if (line === '' || line.startsWith(':')) { continue } // 空行/keepalive 注释
+        if (line.startsWith('event: ')) { eventType = line.slice(7).trim(); continue }
+        if (line.startsWith('data: ') && eventType !== '') {
+          let parsed = null
+          try { parsed = JSON.parse(line.slice(6)) } catch { parsed = null }
+          if (parsed !== null && typeof parsed === 'object') {
+            if (typeof parsed.bot === 'string' && parsed.bot !== '') sseBotId = parsed.bot
+            try { handleDispatch(String(parsed.event ?? eventType), parsed.data ?? {}) } catch (error) {
+              warn(`事件处理异常: ${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+        }
+      }
+    }
+    if (!stopRequested) throw new Error('网关 SSE 流结束')
+  }
+
   async function connect() {
+    if (GATEWAY) return connectSse()
     const url = await fetchGatewayUrl()
     if (stopRequested) return
     if (WebSocketImpl === undefined) throw new Error('当前运行时无 WebSocket（需要 Node 22+）')
@@ -636,12 +801,8 @@ export function createQqInbound(options = {}) {
    *  任一段失败即抛错（已发段不撤回，与 iLink 分块语义一致）。 */
   async function postMessage(chatId, content, msgId = undefined) {
     if (fetchImpl === undefined) return null
-    const token = await tokens.get()
     const target = String(chatId)
     const kind = targetKindOf(target)
-    const url = kind === 'group'
-      ? `${apiBase}/v2/groups/${target}/messages`
-      : `${apiBase}/v2/users/${target}/messages`
     const chunks = splitByCodePoints(String(content ?? ''), QQ_TEXT_MAX_CODEPOINTS, { preferSentenceBoundary: true })
     const pieces = chunks.length > 0 ? chunks : ['']
     if (msgId !== undefined) {
@@ -657,6 +818,16 @@ export function createQqInbound(options = {}) {
       setBounded(msgSeqs, target, seq, CHAT_STATE_MAX, onEvict)
       const body = { content: piece, msg_type: 0, msg_seq: seq }
       if (msgId !== undefined) body.msg_id = msgId
+      if (GATEWAY) {
+        // 统一网关模式：raw_qq 透传（scene 由网关 target 决定，本侧只管消息体）
+        const result = await gwSendRawQq(body)
+        lastId = msgIdOfGatewayResult(result) ?? `qq:${target}:${seq}`
+        continue
+      }
+      const token = await tokens.get()
+      const url = kind === 'group'
+        ? `${apiBase}/v2/groups/${target}/messages`
+        : `${apiBase}/v2/users/${target}/messages`
       const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `QQBot ${token}` },
@@ -672,8 +843,11 @@ export function createQqInbound(options = {}) {
   }
 
   /** 互动事件回执（PUT /interactions/{id}，50QPS）：3 秒窗口内告知平台已受理，
-   *  否则用户端按钮一直 loading。失败由调用方 catch（不致命）。 */
+   *  否则用户端按钮一直 loading。失败由调用方 catch（不致命）。
+   *  统一网关模式下不执行——网关 qqws 收到 INTERACTION_CREATE 即自动回应，
+   *  本侧再 PUT 属重复回应（且直连 PUT 需要 QQ 凭证，网关模式不持凭证）。 */
   async function ackInteraction(interactionId) {
+    if (GATEWAY) return
     if (fetchImpl === undefined) return
     const token = await tokens.get()
     await fetchWithTimeout(`${apiBase}/interactions/${encodeURIComponent(interactionId)}`, {
@@ -683,22 +857,27 @@ export function createQqInbound(options = {}) {
     })
   }
 
-  /** 发送 markdown + 内嵌键盘（审批按钮卡片，msg_type=2）。失败抛错，调用方降级文本。 */
+  /** 发送 markdown + 内嵌键盘（审批按钮卡片，msg_type=2）。失败抛错，调用方降级文本。
+   *  统一网关模式：raw_qq 透传整张卡片（keyboard 与 markdown 同体，网关转发到 target）。 */
   async function postMarkdownWithKeyboard(chatId, markdownContent, keyboard) {
     if (fetchImpl === undefined) return null
-    const token = await tokens.get()
     await rateGate.gate()
     const target = String(chatId)
     const seq = (msgSeqs.get(target) ?? 0) + 1
     setBounded(msgSeqs, target, seq, CHAT_STATE_MAX, onEvict)
-    const kind = targetKindOf(target)
-    const url = kind === 'group'
-      ? `${apiBase}/v2/groups/${target}/messages`
-      : `${apiBase}/v2/users/${target}/messages`
     // Markdown+键盘是单张卡片：超长只按码点截断（取首块），不拆多卡——键盘必须与卡片
     // 同体，拆卡会重复按钮/permission；码点截断同样不产生孤立代理项（G-22 同根）。
     const markdownText = splitByCodePoints(String(markdownContent ?? ''), QQ_MARKDOWN_MAX_CODEPOINTS)[0] ?? ''
     const body = { msg_type: 2, msg_seq: seq, markdown: { content: markdownText }, keyboard }
+    if (GATEWAY) {
+      const result = await gwSendRawQq(body)
+      return msgIdOfGatewayResult(result) ?? `qq-kb:${target}:${seq}`
+    }
+    const kind = targetKindOf(target)
+    const url = kind === 'group'
+      ? `${apiBase}/v2/groups/${target}/messages`
+      : `${apiBase}/v2/users/${target}/messages`
+    const token = await tokens.get()
     const response = await fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `QQBot ${token}` },
@@ -713,16 +892,38 @@ export function createQqInbound(options = {}) {
 
   return {
     channel: 'qq',
-    accountId: String(config?.appId ?? ''),
+    accountId: accountIdOf(),
     // v0.8.4：按钮化落地（发送失败自动降级文本，capabilities 仅影响文案分流）
     capabilities: { buttons: true },
 
-    /** 启动网关连接（幂等；失败中文 warn 后允许再次 start 重试）。 */
+    /** 启动网关连接（幂等；失败中文 warn 后允许再次 start 重试）。
+     *  统一网关模式：connectSse() 阻塞在读循环，断流后在本 promise 内按指数退避
+     *  重连（与直连模式 close→scheduleReconnect 语义对齐）；连接存活超过退避上限
+     *  视为已恢复，重置退避计数。 */
     start() {
       if (running || startPromise !== null) return
       running = true
       stopRequested = false
       startPromise = (async () => {
+        if (GATEWAY) {
+          for (;;) {
+            if (stopRequested) return
+            const connectedAt = Date.now()
+            try {
+              await connectSse()
+              if (stopRequested) return
+              warn('统一网关 SSE 流结束')
+            } catch (error) {
+              if (stopRequested) return
+              warn(`统一网关 SSE 断开: ${error instanceof Error ? error.message : String(error)}`)
+            }
+            if (Date.now() - connectedAt > reconnectCapMs) reconnectAttempts = 0
+            const delay = Math.min(reconnectBaseMs * 2 ** reconnectAttempts, reconnectCapMs)
+            reconnectAttempts += 1
+            await new Promise((resolve) => { reconnectTimer = setTimeout(resolve, delay) })
+            reconnectTimer = null
+          }
+        }
         try {
           await connect()
         } catch (error) {
@@ -734,13 +935,15 @@ export function createQqInbound(options = {}) {
       })()
     },
 
-    /** 停止并清理全部定时器/连接（幂等）。 */
+    /** 停止并清理全部定时器/连接（幂等）。
+     *  先 cleanupSocket（中止 SSE 读循环/关闭 WS）再 await startPromise——v0.14 修复
+     *  死锁：网关模式的 startPromise 要等读循环退出，而读循环退出靠本侧 abort。 */
     async stop() {
       stopRequested = true
       running = false
-      try { await startPromise } catch { /* 启动失败不影响停止 */ }
       if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null }
       cleanupSocket()
+      try { await startPromise } catch { /* 启动失败不影响停止 */ }
       // Issue #23：stop 后复位全部连接级心跳运行态，保证 restart 能重新正常握手与起搏。
       heartbeatArmed = false
       heartbeatIntervalMs = null
@@ -816,13 +1019,33 @@ export function createQqInbound(options = {}) {
       try {
         const isUserTarget = targetKindOf(chatId) === 'user'
         if (!isUserTarget) return null // 群聊不展示可操作提问卡，避免成员间信息/权限泄漏
-        const buttons = options.slice(0, 5).map((label, index) => ({
+        // 按钮标签只放编号「1」「2」…：正文已经用 `**1.** 选项内容` 列了清单，
+        // 按钮再塞一遍长文本既挤（15 码点上限）又要和正文两处对读。
+        // 编号即下标 +1，点击回调仍按 optIdx 精确结算。
+        //
+        // 布局：每个选项一个按钮，**两个一行（两排两列）**——一列一个大按钮在手机上
+        // 会把卡片拉得很长，两列更好点也更好看。奇数个时最后一个独占一行。
+        const optionButtons = options.map((label, index) => ({
           id: `q_${index}`,
-          render_data: { label: clampButtonLabel(`${index + 1}. ${String(label)}`), visited_label: clampButtonLabel(t.selectedVisited), style: 0 },
+          render_data: {
+            label: clampButtonLabel(String(index + 1)),
+            visited_label: clampButtonLabel(String(index + 1)),
+            style: 0,
+          },
           action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, String(index), token) },
         }))
-        buttons.push({ id: 'q_custom', render_data: { label: clampButtonLabel(t.customAnswerLabel), visited_label: clampButtonLabel(t.selectedVisited), style: 0 }, action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, 'c', token) } })
-        const messageId = await postMarkdownWithKeyboard(chatId, `${title}\n${content}`, { content: { rows: buttons.map((button) => ({ buttons: [button] })) } })
+        const rows = []
+        for (let i = 0; i < optionButtons.length; i += 2) rows.push({ buttons: optionButtons.slice(i, i + 2) })
+        // 「自定义回答」单独一行、占满整行：它不是选项之一，混进编号格里容易误点。
+        rows.push({
+          buttons: [{
+            id: 'q_custom',
+            render_data: { label: clampButtonLabel(t.customAnswerLabel), visited_label: clampButtonLabel(t.selectedVisited), style: 0 },
+            action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, 'c', token) },
+          }],
+        })
+        const messageId = await postMarkdownWithKeyboard(chatId, `${title}
+${content}`, { content: { rows } })
         return messageId === null ? null : { messageId }
       } catch (error) {
         warn(`提问卡片发送失败，降级编号: ${error instanceof Error ? error.message : String(error)}`)

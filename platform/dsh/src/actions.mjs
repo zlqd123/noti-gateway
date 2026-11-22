@@ -43,7 +43,7 @@ export function createActionDispatcher({ vault = null, store = null, logger = nu
   const t = strings ?? ZH_FALLBACK
   const handlers = new Map() // kind -> handler({ actionKey, payload, via, userId }) -> { ok?, message? }
   const warn = (message) => {
-    try { logger?.warn?.('[dsh-notifier-qq/actions]', message) } catch { /* 日志失败绝不致命 */ }
+    try { logger?.warn?.('[dsh-notifier-gate/actions]', message) } catch { /* 日志失败绝不致命 */ }
   }
   // Interaction Core：act: 行统一状态机（pending→resolved，outcome 字段名保留，
   // 见 interaction/ledger.mjs）。markSource/unmarkSource 只是 srcChats 旁注字段的

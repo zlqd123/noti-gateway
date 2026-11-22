@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "QQ 通知",
+    "description": "任务完成等事件推送到 QQ，支持按项目/会话静音。",
+    "detail": "docs/DETAIL.md"
+  }
+}

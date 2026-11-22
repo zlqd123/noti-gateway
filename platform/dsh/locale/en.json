@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "QQ Notifier",
+    "description": "Push task-completion and other events to QQ, with per-project/session mute rules.",
+    "detail": "docs/DETAIL.md"
+  }
+}

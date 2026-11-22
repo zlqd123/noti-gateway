@@ -30,7 +30,7 @@ export const REMOTE_LOG_DEFAULT_LINES = 20
 
 /** 每渠道的 secret 键：这些字段在日志/诊断里必须脱敏。 */
 const SECRET_FIELDS = {
-  'qq-bot': ['appId', 'appSecret'],
+  'qq-bot': ['appId', 'appSecret', 'gatewayToken', 'gatewaySecret'],
 }
 
 /** 取某渠道的 secret 键列表（未知渠道返回空数组）。 */
@@ -45,12 +45,16 @@ export function secretFieldsOf(type) {
  */
 const FIELD_HINTS = {
   'qq-bot': {
-    appId: { required: true, secret: true, desc: 'QQ 开放平台开发者 ID（q.qq.com → 机器人开发设置）' },
-    appSecret: { required: true, secret: true, desc: '同页面 AppSecret' },
+    gatewayUrl: { required: true, secret: false, desc: 'noti-gateway 地址（如 http://gateway.example:10086）；出站唯一投递路径' },
+    gatewayToken: { required: false, secret: true, desc: 'noti-gateway 的 auth.token（旧共享 token，Bearer 鉴权）' },
+    gatewaySecret: { required: false, secret: true, desc: 'HMAC 多密钥签名密钥（与 gatewayToken 二选一；填了即签名校验，网关优先走 HMAC）' },
+    gatewayKeyId: { required: false, secret: false, desc: 'HMAC 密钥代号（如 dsh/zcode/3-10），网关侧 hint 加速匹配' },
+    gatewaySource: { required: false, secret: false, desc: '网关来源标识（默认 dsh），决定网关侧配额池归属' },
+    appId: { required: false, secret: true, desc: 'QQ 开放平台开发者 ID——仅入站网关使用，出站不再需要' },
+    appSecret: { required: false, secret: true, desc: '同页面 AppSecret——仅入站网关使用' },
     targetType: { required: false, secret: false, desc: '"user"（单聊，默认）或 "group"（群聊）' },
     userId: { required: false, secret: false, desc: '单聊目标用户 openid（targetType=user 时）' },
     groupId: { required: false, secret: false, desc: '群 open id（targetType=group 时）' },
-    markdown: { required: false, secret: false, desc: '默认 markdown（msg_type=2）；填 false 回退纯文本（msg_type=0）' },
   },
 }
 
@@ -155,9 +159,13 @@ export function maskChannelConfig(type, cfg) {
 export function resolveConfig(config = {}) {
   const raw = config ?? {}
   const enabled = raw.enabled !== false
+  // 尾沿防抖窗口：task 完成通知的「等待感」全部来自这里——窗口内最后一条事件到点才推送。
+  // 10s 的旧默认让每次任务完成都必然多等最多 10 秒，属于设计期取值而非需求。
+  // 默认降到 1500ms：仍能合并「start→end 快速连发 / 连续多 turn」的重复通知，
+  // 但用户几乎感知不到延迟。需要更强合并的用户可显式把 debounceMs 调大。
   const debounceMs = typeof raw.debounceMs === 'number' && Number.isFinite(raw.debounceMs)
     ? Math.max(0, Math.trunc(raw.debounceMs))
-    : 10000
+    : 1500
   const summaryMaxChars = typeof raw.summaryMaxChars === 'number' && Number.isFinite(raw.summaryMaxChars)
     ? Math.max(0, Math.trunc(raw.summaryMaxChars))
     : 500
@@ -190,6 +198,13 @@ export function resolveConfig(config = {}) {
     },
     approval: rawEvents.approval !== false,
     agentError: rawEvents.agentError !== false,
+    // 子智能体（session header origin === 'subagent'，判定以 origin 为准——见
+    // dsh-session types：parentSession 单独存在不定性）出站推送总开关：默认关。
+    // 关 = 子会话的一切事件线（turn/end 完成、错误、心跳/卡住）静默跳过，且不再
+    // 进 route:sessions 台账；events.subagent: true 打开后与普通会话走完全相同的
+    // kinds/muteRules/routing 链。
+    subagent: rawEvents.subagent === true
+      || (rawEvents.subagent !== null && typeof rawEvents.subagent === 'object' && rawEvents.subagent.enabled === true),
     // ---- v0.5 状态上报三键（移动指挥中心）----
     // turnStart 默认关：桌面场景每 turn 一条「任务开始」是噪音；移动场景（发完任务
     // 即离开）建议显式开启。longRunning/stall 默认开：低噪高值（15min+ 长任务心跳 /

@@ -1,20 +1,23 @@
-# dsh-notifier-qq bundle patch: inserts the plugin row into the profile roster.
-# Install with `dsh plugin --profile <name> add file:/path/to/dsh-notifier-qq`;
+# dsh-notifier-gate bundle patch: inserts the plugin row into the profile roster.
+# Install with `dsh plugin --profile <name> add file:/path/to/dsh-notifier-gate`;
 # the patch layer is applied through the loader on boot.
 #
+# id / name 必须与 package.json 的包名一致：loader 按 name 作为模块 specifier 去
+# resolve，写成不存在的包名会让整条 bundle 在启动时被跳过（插件「启动时没能加载」）。
+#
 # 空配置随插件附带：channels 为空时插件只订阅不动作（绝不弄崩启动）。
-# 本副本会在装配期自动沿用原 dsh-notifier 插件在 profile 里的 qq-bot 配置与持久身份，
-# 因此「只装副本、不重填凭证」即可跑起来；要覆盖请在 profile 的 cordis.patch.yml 里
-# 写 `- id: dsh-notifier-qq` 加 config（显式配置永远优先于借用）。
+# 本插件的配置**唯一来源就是自己的配置行**（`- id: dsh-notifier-gate` 的 config）：
+# 不读取、也不借用原 dsh-notifier 插件的任何配置或状态。要填凭证请在 profile 的
+# cordis.patch.yml 里写 `- id: dsh-notifier-gate` 加 config（整块替换本行 config）。
 - insert:
-    - id: dsh-notifier-qq
-      name: 'dsh-notifier-qq'
+    - id: dsh-notifier-gate
+      name: 'dsh-notifier-gate'
       config:
         enabled: true
         debounceMs: 10000
         summaryMaxChars: 500
         channels: []
-        # 管理台默认关：本副本的配置继承原插件，通常不需要额外开本机网页管理台。
-        # 需要时在 profile patch 里覆盖 admin.enabled: true（端口须避开 winnat 保留段）。
+        # 管理台默认关：需要时在 profile patch 里覆盖 admin.enabled: true
+        # （端口须避开 winnat 保留段）。
         admin:
           enabled: false

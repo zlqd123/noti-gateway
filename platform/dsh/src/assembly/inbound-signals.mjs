@@ -1,4 +1,4 @@
-// dsh-notifier-qq src/assembly/inbound-signals.mjs
+// dsh-notifier-gate src/assembly/inbound-signals.mjs
 // 入站通道 resolve/启用信号（原 dsh-notifier 六通道版本裁剪为 QQ 单通道）。
 // 纯计算，无副作用；任何解析失败只 warn + 标记 !ok，绝不弄崩装配。
 

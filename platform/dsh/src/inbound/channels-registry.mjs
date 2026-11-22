@@ -1,4 +1,4 @@
-// dsh-notifier-qq inbound/channels-registry.mjs
+// dsh-notifier-gate inbound/channels-registry.mjs
 // 入站渠道枚举的单一事实来源。
 //
 // 本副本为 QQ 专项裁剪版：入站通道全集只有 qq 一个。原六通道清单

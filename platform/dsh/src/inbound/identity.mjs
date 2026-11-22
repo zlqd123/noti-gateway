@@ -9,6 +9,7 @@
 // 军规：读失败回退空对象（fail-open 读），写失败由 store 保留 dirty 重试；绝不覆写损坏现场。
 
 import { isValidTargetId } from './target-guard.mjs'
+import { createLog } from '../log.mjs'
 import { INBOUND_CHANNEL_SET } from './channels-registry.mjs'
 import { setDurable, transactDurable } from './store.mjs'
 
@@ -72,6 +73,30 @@ function keyFor(channel, userId, accountId = undefined) {
   return account === DEFAULT_ACCOUNT_ID ? bindingKey(channel, userId) : principalKey(channel, account, userId)
 }
 
+/**
+ * 绑定键解析（读路径唯一入口）：先精确命中 `(channel, accountId, userId)`，
+ * 未命中且查询的是非默认账号时回落到渠道级键 `(channel, userId)`。
+ *
+ * 为什么必须回落：v0.13（C11.5 / R2）引入多账号 principal 键之前落的绑定记录**不带
+ * accountId**——它们的语义是「该用户在该渠道」，而不是「该用户在名为 default 的账号」。
+ * 适配器随后开始上报真实账号标识（QQ 传 appId、飞书传 appId……），精确键必然打 miss。
+ * 若不做回落，升级后存量绑定会集体失效：入站被误判「不在白名单」、/unpair 报 not-found、
+ * /whoami 把 owner 降级成 member——三条互不相干的故障，同一个成因。
+ *
+ * 回落只放宽**历史无账号记录**；带 accountId 的记录仍是账号级精确绑定，
+ * 多账号场景（同一用户控制两个机器人）不会被这次回落串到另一账号。
+ *
+ * @returns {string|null} 实际命中的存储键；null = 该用户在此渠道/账号下没有绑定
+ */
+function resolveBindingKey(table, channel, userId, accountId = undefined) {
+  const exact = keyFor(channel, userId, accountId)
+  if (exact === null) return null
+  if (table[exact] !== undefined) return exact
+  const channelScoped = bindingKey(channel, userId)
+  if (channelScoped !== exact && table[channelScoped] !== undefined) return channelScoped
+  return null
+}
+
 /** 归一化单条绑定记录（读盘防御：坏字段回退默认，坏形状整条丢弃）。 */
 function normalizeBinding(raw, fallbackKey) {
   if (raw === null || typeof raw !== 'object') return null
@@ -110,10 +135,9 @@ const PENDING_MAX = 512
  */
 export function createIdentity(options = {}) {
   const store = options.store ?? null
-  const warn = (message) => {
-    try { options.logger?.warn?.('[dsh-notifier-qq/identity]', message) } catch { /* 日志失败绝不致命 */ }
-    try { console.error('[dsh-notifier-qq/identity]', message) } catch { /* 控制台不可用不致命 */ }
-  }
+  const log = createLog({ logger: options.logger, tag: '[dsh-notifier-gate/identity]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
 
   /** 读绑定表（store 读收敛让宿主进程半秒内看到 CLI/管理台写入）。 */
   function readBindings() {
@@ -243,8 +267,10 @@ export function createIdentity(options = {}) {
       warn(`拒绝含冒号的 userId 绑定（复合键截断风险）：${channel}:${uid.slice(0, 32)}`)
       return { ok: false, reason: 'invalid-user' }
     }
+    // 已绑定判定走解析（精确键 → 渠道级回落）：历史无账号行已代表「此人在此渠道」，
+    // 再插一条账号级行只会给同一身份留下两条记录，/unpair 删掉其中一条后仍然放行。
+    if (resolveBindingKey(table, channel, uid, normalizedAccountId) !== null) return { ok: false, reason: 'already-bound' }
     const key = keyFor(channel, uid, normalizedAccountId)
-    if (table[key] !== undefined) return { ok: false, reason: 'already-bound' }
     const record = {
       channel,
       userId: uid,
@@ -267,9 +293,9 @@ export function createIdentity(options = {}) {
       // 防读写两侧漂移——若写回用裸 channel 拼键，未来分量归一放宽时会落出
       // ' telegram :user' 这类永不被读键命中的幽灵重复键。现网适配器输出恰好归一，
       // 此修是休眠边界封口，不改变现网行为。
-      const key = keyFor(channel, userId, accountId)
-      if (key === null) return false
       const table = readBindings()
+      const key = resolveBindingKey(table, channel, userId, accountId)
+      if (key === null) return false
       const record = table[key]
       if (record === undefined) return false
       // lastSeenAt 节流更新（内存判定 + 稀疏落盘，不放大写放大）
@@ -299,6 +325,21 @@ export function createIdentity(options = {}) {
       const table = readBindings()
       const records = Object.values(table)
       return channel === '' ? records : records.filter((record) => record.channel === channel)
+    },
+
+    /**
+     * 取单条绑定记录（准入/自述/解绑共用的读路径）。
+     *
+     * 调用方过去自己按 `String(record.accountId ?? 'default') === envelope.accountId` 过滤，
+     * 这在「历史无账号行 + 适配器上报真实账号」的组合下恒 false：/whoami 把 owner 显示成
+     * member、/unpair 查不到 role 而绕过末位 owner 守卫。改用与 allows 同源的解析，
+     * 存储键规则只在一处。
+     * @returns {object|undefined}
+     */
+    find(channel, userId, accountId = undefined) {
+      const table = readBindings()
+      const key = resolveBindingKey(table, channel, String(userId ?? ''), accountId)
+      return key === null ? undefined : table[key]
     },
 
     /** owner 数量（末位 owner 守卫用）。 */
@@ -382,9 +423,14 @@ export function createIdentity(options = {}) {
     /** 移除绑定；末位 owner 不可删（守卫在调用方 admin/命令层，这里只做数据操作）。 */
     removeBinding(channel, userId, accountId = undefined) {
       const table = readBindings()
-      const key = keyFor(channel, String(userId ?? ''), accountId)
-      if (key === null) return { ok: false, reason: 'invalid-account' }
-      if (table[key] === undefined) return { ok: false, reason: 'not-found' }
+      // 解析而非直接拼键：适配器上报的 accountId 与历史无账号行的键不同，
+      // 直接拼键会让 /unpair 对存量绑定恒报 not-found（用户永远删不掉自己）。
+      const key = resolveBindingKey(table, channel, String(userId ?? ''), accountId)
+      if (key === null) {
+        return keyFor(channel, String(userId ?? ''), accountId) === null
+          ? { ok: false, reason: 'invalid-account' }
+          : { ok: false, reason: 'not-found' }
+      }
       delete table[key]
       if (writeBindings(table) !== true) return { ok: false, reason: 'storage-failed' }
       return { ok: true }
@@ -393,10 +439,14 @@ export function createIdentity(options = {}) {
     /** 改 label/role（末位 owner 降级守卫由调用方做）。 */
     updateBinding(channel, userId, diff = {}, accountId = undefined) {
       const table = readBindings()
-      const key = keyFor(channel, String(userId ?? ''), accountId)
-      if (key === null) return { ok: false, reason: 'invalid-account' }
+      // 与 removeBinding 同口径：命中实际存在的行，而不是按 adapter 账号另造一个键。
+      const key = resolveBindingKey(table, channel, String(userId ?? ''), accountId)
+      if (key === null) {
+        return keyFor(channel, String(userId ?? ''), accountId) === null
+          ? { ok: false, reason: 'invalid-account' }
+          : { ok: false, reason: 'not-found' }
+      }
       const record = table[key]
-      if (record === undefined) return { ok: false, reason: 'not-found' }
       if (typeof diff.label === 'string') record.label = diff.label.slice(0, 64)
       if (VALID_ROLES.has(diff.role)) record.role = diff.role
       table[key] = record

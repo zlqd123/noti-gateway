@@ -26,12 +26,21 @@ function corruptBackupPath(filePath) {
   return `${filePath}.corrupt.${Date.now()}.${process.pid}.${Math.random().toString(36).slice(2, 8)}`
 }
 
+/** 进程内一次性控制台提示（已自愈状态的告知，不重复刷屏）。 */
+const notedOnce = new Set()
+function onceConsoleNote(message) {
+  const key = String(message)
+  if (notedOnce.has(key)) return
+  notedOnce.add(key)
+  try { console.info('[dsh-notifier-gate/store]', message) } catch { /* 控制台不可用不致命 */ }
+}
+
 /** DSH 数据目录：$DSH_HOME（宿主约定）回退 ~/.dsh。 */
 export function defaultStateDir() {
   const home = process.env.DSH_HOME
     ?? (process.env.HOME || process.env.USERPROFILE ? `${process.env.HOME || process.env.USERPROFILE}/.dsh` : null)
   // dsh-notifier-qq：本副本有独立的 state 目录，绝不写原插件的 state.json。
-  // 原插件的状态由 compat/original-config.mjs 以只读方式借用（单向）。
+  // 本插件与原 dsh-notifier 插件完全解耦：不读取也不借用它的任何配置或状态。
   return home !== null ? `${home}/dsh-notifier-qq` : '.dsh-notifier-qq'
 }
 
@@ -66,10 +75,12 @@ export function createStore(filePath) {
         const mode = statSync(filePath).mode & 0o777
         if (mode !== 0o600) {
           try {
-            console.error('[dsh-notifier-qq/store]', `state 文件权限过宽（${mode.toString(8)}，应为 600），尝试收紧: ${filePath}`)
             chmodSync(filePath, 0o600)
+            // 自愈成功：降为一次性 console 提示（不告警）。这条以前每次启动都打
+            // 「权限过宽」，但它随后就被自动修正了——属于已自愈状态，不该占据告警位。
+            onceConsoleNote(`state 文件权限 ${mode.toString(8)} 已自动收紧为 600：${filePath}`)
           } catch (chmodError) {
-            console.error('[dsh-notifier-qq/store]', `state 文件权限收紧失败（不阻塞启动）: ${chmodError instanceof Error ? chmodError.message : String(chmodError)}`)
+            console.error('[dsh-notifier-gate/store]', `state 文件权限过宽（${mode.toString(8)}）且收紧失败，不阻塞启动: ${chmodError instanceof Error ? chmodError.message : String(chmodError)}`)
           }
         }
       } catch { /* stat 失败（文件刚被移走等）：自检跳过，不阻塞 */ }
@@ -117,7 +128,7 @@ export function createStore(filePath) {
           : skippedForSize
             ? `；文件异常巨大（${sizeBytes} bytes），跳过取证复制以免占满磁盘，原始现场保留在原位`
             : '；取证转存失败（备份目录不可写？）'
-        console.error('[dsh-notifier-qq/store]', `state 文件启动时损坏，读侧按空状态起步、写侧已 fail-closed（绑定/待审批等记忆丢失，修复文件后方可写）: ${filePath}${detail}`)
+        console.error('[dsh-notifier-gate/store]', `state 文件启动时损坏，读侧按空状态起步、写侧已 fail-closed（绑定/待审批等记忆丢失，修复文件后方可写）: ${filePath}${detail}`)
       } catch { /* 控制台不可用不致命 */ }
       return {}
     }
@@ -244,7 +255,7 @@ export function createStore(filePath) {
     }
     if (!warnedLockTimeout) {
       warnedLockTimeout = true
-      try { console.error('[dsh-notifier-qq/store]', `写锁等待超时（${lockPath}），返回 STATE_BUSY`) } catch { /* 控制台不可用不致命 */ }
+      try { console.error('[dsh-notifier-gate/store]', `写锁等待超时（${lockPath}），返回 STATE_BUSY`) } catch { /* 控制台不可用不致命 */ }
     }
     return { ok: false, code: 'STATE_BUSY', release: () => {} }
   }
@@ -307,11 +318,11 @@ export function createStore(filePath) {
         const backup = corruptBackupPath(filePath)
         try {
           renameSync(filePath, backup)
-          console.error('[dsh-notifier-qq/store]', `state 文件损坏，已转存现场为 ${backup} 并以内存态重建（副本可手工排查恢复）`)
+          console.error('[dsh-notifier-gate/store]', `state 文件损坏，已转存现场为 ${backup} 并以内存态重建（副本可手工排查恢复）`)
         } catch (renameError) {
           if (!warnedCorrupt) {
             warnedCorrupt = true
-            try { console.error('[dsh-notifier-qq/store]', `state 文件损坏且转存失败（${renameError instanceof Error ? renameError.message : String(renameError)}），暂停写盘保留现场: ${filePath}`) } catch { /* 控制台不可用不致命 */ }
+            try { console.error('[dsh-notifier-gate/store]', `state 文件损坏且转存失败（${renameError instanceof Error ? renameError.message : String(renameError)}），暂停写盘保留现场: ${filePath}`) } catch { /* 控制台不可用不致命 */ }
           }
           return { ok: false, committed: false, durable: false, code: 'STATE_CORRUPT' }
         }
@@ -335,7 +346,7 @@ export function createStore(filePath) {
       if (tmp !== null) try { unlinkSync(tmp) } catch { /* temp cleanup best effort */ }
       if (!warnedSaveError) {
         warnedSaveError = true
-        try { console.error('[dsh-notifier-qq/store]', `state 事务写盘失败（内存与磁盘保持不变）: ${filePath}`) } catch { /* 控制台不可用不致命 */ }
+        try { console.error('[dsh-notifier-gate/store]', `state 事务写盘失败（内存与磁盘保持不变）: ${filePath}`) } catch { /* 控制台不可用不致命 */ }
       }
       return { ok: false, committed: false, durable: false, code: error?.code === 'STATE_BUSY' ? 'STATE_BUSY' : 'STATE_WRITE_FAILED', error }
     } finally {

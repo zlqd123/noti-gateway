@@ -1,4 +1,4 @@
-// dsh-notifier-qq src/assembly/inbound-channels.mjs
+// dsh-notifier-gate src/assembly/inbound-channels.mjs
 // Inbound channel registry and lifecycle wiring（原六通道版本裁剪为 QQ 单通道）。
 //
 // This module owns only transport assembly: the optional QQ channel factory is
@@ -7,6 +7,7 @@
 // conversation semantics remain in their existing modules.
 
 import { createQqInbound } from '../inbound/qq-gw.mjs'
+import { createLog } from '../log.mjs'
 
 // QQ 入站工厂（裸 WS 网关 + REST，零 SDK 依赖）。调用方经 `factories` 覆盖（测试用）。
 const DEFAULT_FACTORIES = Object.freeze({
@@ -38,6 +39,9 @@ export function createInboundChannelRegistry(deps = {}) {
     warn = () => {}, factories = {},
   } = deps
   const factory = { ...DEFAULT_FACTORIES, ...factories }
+  // 启动成功走 info（常规生命周期，不进控制台）；失败仍走调用方注入的 warn。
+  const log = createLog({ logger, tag: '[dsh-notifier-gate/inbound]' })
+  const info = (message) => log.info(message)
   const interactiveInstances = []
   const replyTargets = new Map()
   // 真实运行时真值——只有 start() 成功的实例才入表。
@@ -66,7 +70,8 @@ export function createInboundChannelRegistry(deps = {}) {
       interactiveInstances.push(value)
       replyTargets.set(name, value)
       running.set(name, value)
-      warn(readyMessage())
+      // 启动成功属正常生命周期：info（只进 logger），不占控制台告警位。
+      info(readyMessage())
       return value
     })
     return instance

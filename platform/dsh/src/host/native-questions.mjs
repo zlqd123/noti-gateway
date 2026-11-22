@@ -66,7 +66,7 @@ export function createNativeQuestionBridge(deps = {}) {
   const { ctx, questionBridge } = deps
   const logger = deps.logger ?? null
   const warn = (message) => {
-    try { logger?.warn?.('[dsh-notifier-qq/native-questions]', message) } catch { /* 日志失败绝不致命 */ }
+    try { logger?.warn?.('[dsh-notifier-gate/native-questions]', message) } catch { /* 日志失败绝不致命 */ }
   }
 
   let provider = null
@@ -103,12 +103,22 @@ export function createNativeQuestionBridge(deps = {}) {
     })
     const payload = {
       questions: normalized.map((entry) => ({
+        // id 透传给 questionBridge：GUI 先答回灌（settleFromWeb）按 id 把答案批次
+        // 对位到在途问题行（索引兜底），否则多问请求会错位。
+        id: entry.id,
         question: entry.question,
         options: entry.options.labels.map((label) => ({ label })),
         multiSelect: entry.multiSelect,
       })),
-      context: normalized.map((entry) => entry.detail).filter((part) => part !== '').join('\n'),
-      // 原生提问超时由 questionBridge 的默认策略兜底（宿主 signal 取消见 review 收口）。
+      context: [String(request?.context ?? ''), ...normalized.map((entry) => entry.detail)]
+        .filter((part) => part !== '').join('\n'),
+    }
+    // ask_user 经本 seam 出题时会带上 timeoutMs（原生 ask_user_question 请求没有该字段）：
+    // 透传给 questionBridge，让 QQ 卡片作答时限与 askTimed 前台等待共用同一时限；
+    // 缺失时由 questionBridge 默认策略兜底（宿主 signal 取消见 review 收口）。
+    const requestTimeoutMs = Number(request?.timeoutMs)
+    if (Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0) {
+      payload.timeoutMs = requestTimeoutMs
     }
     let outcome
     try {
@@ -155,9 +165,12 @@ export function createNativeQuestionBridge(deps = {}) {
    * answerer（next()）race，先答先算：
    *  - 手机/管理台先答 → 本侧答案上交宿主（下游成为输家，catch 兜底防未处理拒绝；
    *    GUI 卡片能否自动收起属宿主 ask() signal 语义，见模块头「已知限制」）。
-   *  - GUI 先答 → 下游答案上交宿主；abort 拦截器范围取消信号——askQuestions 侧清
-   *    延迟推卡（Stage 0→1 pushTimer）、停升级、abandon 等待（账本行终结），多问
-   *    请求的后续问题不再开（router 循环头 aborted 检查）。绝不迟推卡。
+   *  - GUI 先答 → 下游答案上交宿主；abort 拦截器范围取消信号（reason 携带 Web 答案
+   *    批次）——askQuestions 侧清延迟推卡（Stage 0→1 pushTimer）、停升级，并把在途
+   *    问题按「先答先算」跨端结算（settleFromWeb：answered via web / skipped）：已推
+   *    QQ 卡片改「✅ 已作答：…（来源 web）」/「⏭ 已跳过」，绝不误标「⏹ 已终止」
+   *    （2026-11-10 多端同步回归修复）；多问请求的后续问题不再开（router 循环头
+   *    aborted 检查）。绝不迟推卡。
    *  - 下游先 reject（GUI answerer 异常 / headless 宿主无 answerer 的 NO_PROVIDER）
    *    → 不判死整场 race：下游转为永不 settle，等手机/管理台作答兜底。
    *  - 空请求 / 无入站交互通道（canDeliver 假）→ 原样透传 next()，GUI-only 宿主
@@ -165,6 +178,12 @@ export function createNativeQuestionBridge(deps = {}) {
    * next() 至多调用一次（nextCalled 哨兵）；拦截器任何异常透传下游或返回空答案，
    * 绝不让宿主提问被静默吞掉。
    */
+  /** 造一份「全部未选」的答案批次（宿主据此按自身语义解释为未作答）。 */
+  const EMPTY_ANSWERS = (request) => ({
+    answers: (Array.isArray(request?.questions) ? request.questions : [])
+      .map((question) => ({ id: String(question?.id ?? ''), selected: [] })),
+  })
+
   function waterfallHandler(request, next) {
     let nextCalled = false
     const downstreamOnce = () => {
@@ -176,24 +195,74 @@ export function createNativeQuestionBridge(deps = {}) {
       if (questions.length === 0 || canDeliver() !== true) return downstreamOnce()
       // 拦截器范围取消信号：GUI 先答时 abort（收尾语义全部在 askQuestions 侧落地）。
       const controller = new AbortController()
-      // hostAsk 全捕获（内部 catch → 空答案），此处再兜一层防御：绝不让 race 因本侧 reject。
-      const telegramAnswer = Promise.resolve().then(() => hostAsk(request, { signal: controller.signal }))
-        .catch(() => ({ answers: (Array.isArray(request?.questions) ? request.questions : [])
-          .map((question) => ({ id: String(question?.id ?? ''), selected: [] })) }))
+      // 本侧原始结果（hostAsk 全捕获，保证必然 settle）：真答案或超时空答案。
+      const mobileAnswerRaw = Promise.resolve().then(() => hostAsk(request, { signal: controller.signal }))
+        .catch(() => EMPTY_ANSWERS(request))
+      const isAnswered = (result) => Array.isArray(result?.answers)
+        && result.answers.some((entry) => (Array.isArray(entry?.selected) && entry.selected.length > 0)
+          || (typeof entry?.custom === 'string' && entry.custom !== ''))
+      // 关键：本侧「没答出来」（超时/未作答/异常 → 全空 selected 且无 custom）时
+      // **不得**抢走 race。若把它当赢家返回给宿主，宿主据此认为"用户没选"，
+      // 而此刻 Web 卡片还在等人作答——真机事故（2026-11-02 计划审批）：
+      // 用户后点的 Approve 落在孤儿卡上，答案无人消费，表现为「点了没生效，窗口消失」。
+      // 这里把「空答案」转成永不 settle：GUI 活着时让下游继续跑完；
+      // 只有下游确认死亡（downstreamDied$）才走 died 分支闭环宿主。
+      const telegramAnswer = mobileAnswerRaw.then((result) => (isAnswered(result) ? result : new Promise(() => {})))
       const downstream = downstreamOnce()
       // 输家卫生（两向）：原始 downstream 的 rejection 在此消费，绝不未处理；
       // race 内的派生 promise 对 rejection 转「永不 settle」——下游失败（GUI 异常 /
       // headless NO_PROVIDER）不判死提问，手机/管理台仍可作答。
-      downstream.catch(() => { /* race 输家，无需处理 */ })
+      // 下游死亡信号：GUI answerer 走到了 reject（headless 无 answerer 的 NO_PROVIDER、
+      // GUI 异常、请求被取消）。此时 Web 面已确认死亡，手机侧的超时空答案才可以
+      // 闭环宿主——否则宿主 ask() 会无限挂起。
+      let downstreamDiedNotify = () => {}
+      const downstreamDied$ = new Promise((resolve) => { downstreamDiedNotify = resolve })
+      downstream.catch(() => { downstreamDiedNotify(); })
       let downstreamWon = false
+      // 防泄漏硬顶（不再是「替用户决定」的兜底）：上面已保证 GUI 活着时绝不注入空答案，
+      // 但宿主 crash-收尾/信号中断等极端路径仍可能让 race 双方都悬置。30 分钟硬顶只是
+      // 内存安全阀；到达时若 GUI 仍活着，同样只是退出 race、把控制权交回宿主当前语境，
+      // 不主动产生"用户没选"的答案——空答案由宿主自身语义处理。
+      // 真机事故复盘（2026-11-02 计划审批）：旧的 5 分钟定时器与插件内部提问超时等长，
+      // 到点抢答空答案 → 宿主认为"keep planning"，而 Web 卡片还活着 → 用户点击落在
+      // 孤儿卡上，答案无人消费，表现为「点了没生效，窗口消失」。
+      const LEASE_MS = Math.max(1000, Number(deps.unansweredFallbackMs) || 30 * 60_000)
+      const lease = new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('lease-expired'), LEASE_MS)
+        if (typeof timer?.unref === 'function') timer.unref()
+      })
       return Promise.race([
         telegramAnswer,
         downstream.then(
           (value) => { downstreamWon = true; return value },
           () => new Promise(() => { /* 下游失败：悬置，等本侧答案 */ }),
         ),
+        downstreamDied$.then(() => 'downstream-died'),
+        lease,
       ]).then((winner) => {
+        // GUI 拿到答案：正常闭环，并收尾本侧等待。
         if (downstreamWon) {
+          // reason 随 abort 传给 askQuestions 的 onAbort：在途问题按 Web 答案批次
+          // 跨端结算（answered via web / skipped，卡片改「✅ 已作答：…（来源 web）」），
+          // 而不是终止账本行——2026-11-10 多端同步回归修复（此前一律 terminate，
+          // QQ 卡片误标「⏹ 已终止：agent 会话已结束」）。
+          try {
+            controller.abort({ kind: 'downstream-win', answers: Array.isArray(winner?.answers) ? winner.answers : [] })
+          } catch { /* 已终结则忽略 */ }
+          return winner
+        }
+        // 下游死亡或租约到点：GUI 已经/将不会再答了，此时手机侧结果（可能已答，
+        // 也可能是超时空答案）允许闭环宿主；两侧都没答就给空答案（宿主自行解释）。
+        if (winner === 'downstream-died' || winner === 'lease-expired') {
+          try { controller.abort() } catch { /* 已终结则忽略 */ }
+          // mobileAnswerRaw 必然 settle（真答案或超时空答案），直接等待它闭环宿主。
+          return mobileAnswerRaw
+        }
+        // 本侧先答（真答案）：收尾 GUI 卡片。
+        const answered = Array.isArray(winner?.answers)
+          && winner.answers.some((entry) => (Array.isArray(entry?.selected) && entry.selected.length > 0)
+            || (typeof entry?.custom === 'string' && entry.custom !== ''))
+        if (answered) {
           try { controller.abort() } catch { /* 已终结则忽略 */ }
         }
         return winner
@@ -205,7 +274,6 @@ export function createNativeQuestionBridge(deps = {}) {
       return Promise.resolve({ answers: [] })
     }
   }
-
   /**
    * 接入宿主原生问题源。失败（seam 缺失/被占用）时记录原因并安全降级。
    * @param {object} [subCtx] - 可选依赖子上下文（ctx.inject 回调的第一参数）：

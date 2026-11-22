@@ -15,6 +15,7 @@
 // 存储失败退化为内存态，任何输入形状异常都不抛（上游是对话线与宿主总线，绝不能弄崩宿主）。
 
 import { basename } from 'node:path'
+import { createLog } from '../log.mjs'
 import { createHostEventRegistrar, normalizeAgentLifecyclePayload } from '../host-events.mjs'
 import { normalizeControlOverlay } from '../control/session-arbiter.mjs'
 import { setDurable } from '../inbound/store.mjs'
@@ -123,9 +124,9 @@ export function createSessionRegistry(options = {}) {
   const touchWriteMs = nonNegativeMs(options.touchWriteMs, DEFAULT_TOUCH_WRITE_MS)
   const sweepEveryMs = nonNegativeMs(options.sweepEveryMs, DEFAULT_SWEEP_EVERY_MS)
 
-  const warn = (message) => {
-    try { ctx?.logger?.warn?.('[dsh-notifier-qq/session-registry]', message) } catch { /* 日志失败绝不致命 */ }
-  }
+  const log = createLog({ logger: ctx?.logger, tag: '[dsh-notifier-gate/session-registry]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
 
   // ---- store 防御壳：任何存储异常都退化为内存态，绝不向上抛 ----
   const loadSessions = () => {
@@ -765,7 +766,7 @@ export function createSessionRegistry(options = {}) {
 
   // ---- 宿主事件接线（全防御：注册失败降级为惰性建档模式，绝不抛，§4）----
   const disposers = []
-  const hostEvents = createHostEventRegistrar(ctx, warn)
+  const hostEvents = createHostEventRegistrar(ctx, warn, Date.now, info)
   const listen = (event, handler) => {
     const disposer = hostEvents.on(event, (payload) => {
       const agent = normalizeAgentLifecyclePayload(payload)

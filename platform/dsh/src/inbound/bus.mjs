@@ -15,6 +15,7 @@
 //  - 注册面命令（/whoami /pair /unpair + 引导态 /help）在业务扇出前拦截并消费。
 
 import { createCommandHandler, getChannelName, parseCommand } from './commands.mjs'
+import { createLog } from '../log.mjs'
 import { stringsOf } from '../strings.mjs'
 import { setDurable } from './store.mjs'
 
@@ -70,11 +71,9 @@ export function createInboundBus(options = {}) {
   const syntheticDedupWindowMs = options.syntheticDedupWindowMs ?? DEFAULT_SYNTHETIC_DEDUP_WINDOW_MS
   const globalWaiterCap = Math.max(1, Math.min(MAX_GLOBAL_WAITERS, Number(options.maxWaiters) || MAX_GLOBAL_WAITERS))
   const agentWaiterCap = Math.max(1, Math.min(MAX_AGENT_WAITERS, Number(options.maxWaitersPerAgent) || MAX_AGENT_WAITERS))
-  const warn = (message) => {
-    try { options.logger?.warn?.('[dsh-notifier-qq/inbound]', message) } catch { /* 日志失败绝不致命 */ }
-    // v0.6.1 双写 stderr：宿主 logger 不落 stdout 时告警仍可见（真机事故复盘）
-    try { console.error('[dsh-notifier-qq/inbound]', message) } catch { /* 控制台不可用不致命 */ }
-  }
+  const log = createLog({ logger: options.logger, tag: '[dsh-notifier-gate/inbound]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
   const commands = identity !== null && pairing !== null
     ? createCommandHandler({ identity, pairing, logger: options.logger, onBootstrapRemint: options.onBootstrapRemint }, options.strings)
     : null

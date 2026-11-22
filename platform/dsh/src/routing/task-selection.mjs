@@ -113,7 +113,7 @@ export function createTaskSelection(options = {}) {
   const isActive = typeof options.isActive === 'function' ? options.isActive : () => true
 
   const warn = (message) => {
-    try { options.logger?.warn?.('[dsh-notifier-qq/task-selection]', message) } catch { /* 日志失败不致命 */ }
+    try { options.logger?.warn?.('[dsh-notifier-gate/task-selection]', message) } catch { /* 日志失败不致命 */ }
   }
 
   // —— store 防御壳：方法缺失/抛错一律按无数据/写失败处理 ——

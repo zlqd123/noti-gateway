@@ -14,7 +14,7 @@
 export function createEscalationChain({ stages = [], logger = null } = {}) {
   const chains = new Map() // key -> { timers: [], stage: number }
   const warn = (message) => {
-    try { logger?.warn?.('[dsh-notifier-qq/escalation]', message) } catch { /* 日志失败绝不致命 */ }
+    try { logger?.warn?.('[dsh-notifier-gate/escalation]', message) } catch { /* 日志失败绝不致命 */ }
   }
 
   function clear(key) {

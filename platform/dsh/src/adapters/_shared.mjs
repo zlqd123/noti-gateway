@@ -178,15 +178,19 @@ async function guardedFetch(url, init, channel, networkPolicy) {
   return response
 }
 
-/** 统一 JSON POST：AbortController 超时、非 2xx 抛 HTTP_ERROR（附响应现场）。 */
-export async function postJson(url, payload, { headers = {}, timeoutMs = 10000, channel = '渠道', networkPolicy } = {}) {
+/** 统一 JSON POST：AbortController 超时、非 2xx 抛 HTTP_ERROR（附响应现场）。
+ *  可选 sign({ url, method, body }) -> 额外请求头：对【将被发送的 body 字符串】签名，
+ *  保证签名与实际字节严格一致（HMAC 网关鉴权用）。 */
+export async function postJson(url, payload, { headers = {}, timeoutMs = 10000, channel = '渠道', networkPolicy, sign } = {}) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
+    const body = JSON.stringify(payload)
+    const signHeaders = sign ? (await sign({ url, method: 'POST', body }) || {}) : {}
     const response = await guardedFetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json; charset=utf-8', ...headers },
-      body: JSON.stringify(payload),
+      headers: { 'content-type': 'application/json; charset=utf-8', ...headers, ...signHeaders },
+      body,
       signal: controller.signal,
     }, channel, networkPolicy)
     if (!response.ok) {

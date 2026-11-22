@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto'
 import { basename } from 'node:path'
 import { createKeywordFilter, createGraceQueue } from './rules.mjs'
 import { createHostEventRegistrar, normalizeSessionEventArgs } from './host-events.mjs'
+import { createLog } from './log.mjs'
 // v0.5 状态上报 + 动作闭环
 import { createTurnTracker } from './status/turn-tracker.mjs'
 import { normalizeInbound, buildActionPayload } from './inbound/_contract.mjs'
@@ -15,11 +16,23 @@ import { guardTargets } from './inbound/target-guard.mjs'
 import { maskSecrets, normalizeRedaction, MINIMAL_EXCERPT_CHARS } from './redact.mjs'
 // lang: 'zh' | 'en' 自动推送文案表（未知值回落 zh）
 import { stringsOf } from './strings.mjs'
+// 静音规则：设置页 volatile muteRules 覆盖出站解析（会话/项目粒度静音与白名单）
+import { resolveMuteRule } from './mute-rules.mjs'
 
 /** 取会话所属工作区名：cwd 末段，否则 session id。 */
 export function workspaceNameOf(session) {
   const cwd = session?.header?.cwd
   return cwd !== undefined && typeof cwd === 'string' && cwd.length > 0 ? basename(cwd) : String(session?.id ?? '')
+}
+
+/**
+ * 子智能体会话判定：以 session header 的 `origin === 'subagent'` 为唯一依据
+ * （dsh-session types 明确：parentSession 存在与否不定性，fork 历史字段可能残留，
+ * 判定一律看 origin）。header 缺失/形态异常返回 false——与「未知不当子智能体
+ * 误杀」的保守语义一致，主会话永远不被此判定吞掉。
+ */
+export function isSubagentSession(session) {
+  return session?.header?.origin === 'subagent'
 }
 
 /** G-18：6 位十六进制负载摘要（dedup 键追加用，与 wxpusher hash6 同法）。 */
@@ -287,15 +300,21 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
   // lang 文案表：resolvedConfig.lang 已归一（未知值回落 zh），此处不再兜底
   const strings = stringsOf(resolvedConfig.lang)
   const events = resolvedConfig.events ?? { turnEnd: { enabled: true, kinds: {} }, approval: true, agentError: true }
+  // 子智能体推送开关：config 已归一为布尔（缺省 false = 默认静音）；旧调用方
+  // 直传未归一 events 时按从严判定（缺失即关——默认静音方向与文档一致）。
+  const subagentEnabled = events.subagent === true
+    || (events.subagent !== null && typeof events.subagent === 'object' && events.subagent.enabled === true)
   const router = wiring.router ?? null
   const registry = wiring.registry ?? null
+  // 设置页静音规则（volatile ref，带 .get()）；每次出站解析时重新读取。
+  const muteRulesRef = wiring.muteRules ?? null
   const busFn = typeof wiring.bus === 'function' ? wiring.bus : null
   // v0.5 动作闭环（全可选、惰性求值；调用点自带 try/catch + null 判定）
   const actionsFn = typeof wiring.actions === 'function' ? wiring.actions : null
   const interactiveFn = typeof wiring.interactive === 'function' ? wiring.interactive : null
   const keywords = createKeywordFilter(resolvedConfig.keywords)
   // 有界防抖（宪法#4）：溢出时提前触发最旧会话的待推送并告警（warn 在下方定义前先声明引用）
-  const debounce = createTrailingDebounce(resolvedConfig.debounceMs ?? 10000, {
+  const debounce = createTrailingDebounce(resolvedConfig.debounceMs ?? 1500, {
     onOverflow: (key, size) => warn(`防抖表达上限（在途 ${size} 个会话），提前推送最旧会话 ${key} 的待发通知（合并窗提前收口，不丢通知）`),
   })
   // 空闲宽限窗：turn 结束后等 N 秒再打扰；期间用户输入（user/* 事件）即取消。
@@ -307,9 +326,9 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
   const dedup = createDedupLedger()
   // #32：turn/end 正文与心跳摘录的有界来源（见 createAssistantTextCache 注释）
   const assistantCache = createAssistantTextCache()
-  const warn = (message) => {
-    try { ctx?.logger?.warn?.('[dsh-notifier]', message) } catch { /* 日志失败绝不致命 */ }
-  }
+  const log = createLog({ logger: ctx?.logger, tag: '[dsh-notifier-gate]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
   // P1-2 错误可见性（2026-08-20，Trae1）：keywords.regex 开启时，非法正则条目会静默
   // 降级为字面量子串匹配——语义从「正则命中」变「子串包含」，include 规则可能因此
   // 永不命中（通知静默停止）、exclude 规则可能漏拦。降级本身保留（宁可漏拦不炸启动），
@@ -340,14 +359,49 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
    * router 缺失 / session 无 id / 解析异常一律回落「不过滤、不静音」（广播，向后兼容）。
    */
   const resolveOutboundOf = (session) => {
-    if (router === null || session?.id === undefined || session?.id === null) return {}
+    const sid = session?.id === undefined || session?.id === null ? null : String(session.id)
+    const workspace = workspaceNameOf(session)
+    // 设置页 volatile 静音规则优先于 state.json 路由链：每次调用重新读取，热更新即时生效。
+    // 会话无 id 时仍可按 workspace 名命中项目级静音。
+    let override = null
+    try {
+      override = resolveMuteRule(muteRulesRef, sid ?? '', workspace)
+    } catch { /* 规则解析异常不影响原路由链 */ }
+
+    if (router === null || sid === null) {
+      // 无 router / 无会话 id：仍尽量应用 workspace 级静音规则。
+      if (override !== null) return toSendOptions(override)
+      return {}
+    }
     try {
       const globalTypes = Array.isArray(notifier?.channels) ? notifier.channels : []
-      const resolved = router.resolveOutbound(String(session.id), workspaceNameOf(session), globalTypes)
-      return { channelTypes: resolved.channelTypes, quiet: resolved.quiet }
+      const resolved = router.resolveOutbound(sid, workspace, globalTypes)
+      const merged = applyOverride(resolved, override, globalTypes)
+      return { channelTypes: merged.channelTypes, quiet: merged.quiet }
     } catch (error) {
       warn(`出站路由解析失败，本次按全局广播: ${error instanceof Error ? error.message : String(error)}`)
+      if (override !== null) return toSendOptions(override)
       return {}
+    }
+  }
+
+  /** 把静音规则覆盖合并进路由解析结果：quiet 取规则值；channelTypes 白名单交集到全局池。 */
+  function applyOverride(resolved, override, globalTypes) {
+    if (override === null) return resolved
+    const out = { channelTypes: resolved.channelTypes, quiet: resolved.quiet }
+    if (typeof override.quiet === 'boolean') out.quiet = override.quiet
+    if (Array.isArray(override.channelTypes)) {
+      const pool = Array.isArray(globalTypes) && globalTypes.length > 0 ? globalTypes : resolved.channelTypes
+      out.channelTypes = override.channelTypes.filter((t) => !Array.isArray(pool) || pool.includes(t))
+    }
+    return out
+  }
+
+  /** override 单独作用（无 router 时）转 sendOptions，白名单不过滤（无全局池可依据）。 */
+  function toSendOptions(override) {
+    return {
+      quiet: typeof override.quiet === 'boolean' ? override.quiet : undefined,
+      channelTypes: Array.isArray(override.channelTypes) ? override.channelTypes : undefined,
     }
   }
 
@@ -453,7 +507,70 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
     onStall: (session, info) => push(statusIntent('stall', strings.status.stallHeadline, 'timeSensitive', info), session),
   })
 
+  /**
+   * 取会话标题（用于通知正文）。多来源降级，任一失败都只是少一行标题：
+   *   1. `ctx.sessionTitle.get(session)` — DSH 原生会话标题服务（缺注入时取不到）
+   *   2. **自行折叠 `session.snapshotEvents()` 里最后一条 `session/title` 事件** ——
+   *      这正是标题服务内部的实现（`foldSessionTitle(session.snapshotEvents())`），
+   *      不依赖服务注入；宿主只要有会话日志就能拿到（本机实测取到 "gate"）。
+   *   3. `session.header.title` — 旧宿主/测试桩上可能的直挂字段
+   *   4. 空串 — 该行整段不加（宁缺勿造假标题）
+   * @returns {string} 已去控制字符的单行标题；取不到为空串
+   */
+  const sessionTitleOf = (session) => {
+    if (session === null || session === undefined) return ''
+    // 控制字符/换行压成单空格：用码点判断，避免正则转义在不同写入路径下被误解
+    const pick = (value) => {
+      if (typeof value !== 'string') return ''
+      let out = ''
+      for (const ch of value) {
+        const code = ch.codePointAt(0)
+        out += (code < 0x20 || code === 0x7f) ? ' ' : ch
+      }
+      // 连续空格压成一个，再去首尾空白
+      let squeezed = ''
+      let prevSpace = false
+      for (const ch of out) {
+        const isSpace = ch === ' '
+        if (isSpace && prevSpace) continue
+        squeezed += ch
+        prevSpace = isSpace
+      }
+      return squeezed.trim()
+    }
+    // 1) 标题服务（防御式：ctx.get(name, false) 服务不存在时返回 undefined，不抛错）
+    try {
+      const service = typeof ctx?.get === 'function' ? ctx.get('sessionTitle', false) : undefined
+      const fromService = pick(service?.get?.(session)?.title)
+      if (fromService !== '') return fromService
+    } catch { /* 服务缺失/会话已释放：降级 */ }
+    // 2) 自行折叠 session/title 事件（与标题服务同源，但不依赖注入）
+    try {
+      const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : null
+      if (Array.isArray(events)) {
+        for (let i = events.length - 1; i >= 0; i -= 1) {
+          const event = events[i]
+          if (event?.type !== 'session/title') continue
+          // 最后一条 title 事件即当前标题；其标题为空则视为无标题（不再向前找旧值）
+          return pick(event?.data?.title)
+        }
+      }
+    } catch { /* 会话日志不可读：降级 */ }
+    // 3) 旧形状回落
+    try {
+      const fromHeader = pick(session?.header?.title)
+      if (fromHeader !== '') return fromHeader
+    } catch { /* 形状不符即跳过 */ }
+    return ''
+  }
+
   const push = (intent, session) => {
+    // 子智能体总闸（events.subagent，默认关）：默认静音子会话的一切出站推送，
+    // 并且不再 registry.touch 建档（止住 route:sessions 台账被派生子任务灌满）。
+    // 显式 events.subagent: true 打开后走与主会话完全相同的后续链。
+    if (!subagentEnabled && isSubagentSession(session)) {
+      return Promise.resolve(undefined)
+    }
     // v0.5 状态上报文案组装：turn/start / longRunning / stall 三类 intent 的正文
     // 需要 workspace / 运行时长 / 最近输出，intent 纯函数不持有这些，push 侧组装。
     let message
@@ -467,6 +584,21 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
       // #32：turn/end 正文取有界缓存（assistant/message 事件到达时沉淀；不再读 session.events）
       const assistantText = intent.event === 'turn/end' ? assistantCache.get(String(session?.id ?? '')) : ''
       message = intentToMessage(intent, { assistantText, config: resolvedConfig })
+    }
+    // 正文结构（按需求）：正文第一行 = 会话标题，第二行 = 空行，其后接原有正文。
+    // 注意网关渲染口径：qq-bot adapter 把「msg.title + 第一行 content」拆成网关的
+    // title/body 两个字段，所以最终 QQ 里看到的是
+    //   消息标题：✅ 任务完成
+    //   正文   ：<会话标题>
+    //            （空行）
+    //            <原有内容>
+    // 取不到标题时整段不加，保持原样（不造假「(无标题)」）。
+    const titleLine = sessionTitleOf(session)
+    if (titleLine !== '') {
+      const rest = message.content
+      message.content = rest.trim() === ''
+        ? `${titleLine}\n`
+        : `${titleLine}\n\n${rest}`
     }
     // 关键词规则（include 白名单 / exclude 黑名单，黑名单优先）拦下即静默跳过
     const reason = keywords.why(`${message.title}\n${message.content}`)
@@ -514,8 +646,9 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
     const key = intent.event === 'approval/asked' ? `${base}:${hash6(intent.detail)}` : base
     if (!dedup.test(key)) return
     if (intent.event === 'turn/end' || intent.event === 'turn/start') {
-      // turn/end 与 turn/start 共用同一防抖 key（session.id）：10s 内 start→end 连续
+      // turn/end 与 turn/start 共用同一防抖 key（session.id）：窗口内 start→end 连续
       // 时后者替换前者（尾沿合并语义），只发「任务完成」一条；快速连续 turn 同理合并。
+      // 窗口默认 1.5s（原 10s 会让每次完成都多等近 10 秒）。
       debounce.schedule(String(session.id), () => grace.schedule(String(session.id), () => push(intent, session)))
     } else {
       push(intent, session)
@@ -533,7 +666,7 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
     push(intentOfAgentError(payload, strings), agent?.session)
   }
 
-  const hostEvents = createHostEventRegistrar(ctx, warn)
+  const hostEvents = createHostEventRegistrar(ctx, warn, Date.now, info)
   // v0.10 提交7：把宿主事件 registrar 的只读诊断快照外泄给装配层（管理台 /host 的
   // events.received 视图）。快照只含计数+context/scope 状态，无正文/标识符/凭证。
   // 回调接线失败绝不致命（诊断能力降级，事件订阅主链路不受影响）。

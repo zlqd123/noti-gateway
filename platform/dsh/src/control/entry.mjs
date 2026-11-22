@@ -120,7 +120,7 @@ export function createControlEntry({ policy = {}, identity = null, now = Date.no
   const handled = createHandledEvents({ now })
   let disposed = false
   const warn = (message) => {
-    try { logger?.warn?.('[dsh-notifier-qq/control]', message) } catch { /* diagnostics never alter control flow */ }
+    try { logger?.warn?.('[dsh-notifier-gate/control]', message) } catch { /* diagnostics never alter control flow */ }
   }
   const audit = (entry) => {
     try { onAudit?.(entry) } catch { /* audit is strictly out of band */ }
@@ -239,16 +239,21 @@ export function createControlEntry({ policy = {}, identity = null, now = Date.no
       // top-level source fields, so only an authorized spec may retain the event's
       // proven source; generic/direct authorization remains fail-closed on null.
       const policySource = (key) => authorizationCommand && !specAuthorized ? sourceOf(key) : event[key]
+      // 静态策略（config.control）通常不写 chatId/userId——那是「全局策略」，
+      // 而具体会话来源应该来自这条待决记录自己（pushedTo 已由 spec.authorize 校验过）。
+      // 以前这里直接取 canonical source，配置缺字段时 chatId 为 null，
+      // canAcceptCommand 就判 source_mismatch_chatId 把点击静默拒掉——表现就是
+      // 「我明明选了，却提示超时」。这里补一层：canonical 为空时回退到本条待决行的来源。
       const mergedPolicy = normalizeSessionPolicy({
         ...basePolicy,
         ...rowMeta,
         ...(overlay ?? {}),
         capabilities: { ...basePolicy.capabilities, ...(rowMeta.capabilities ?? {}) },
-        sessionId: policySource('sessionId'),
-        channel: policySource('channel'),
-        accountId: policySource('accountId'),
-        userId: policySource('userId'),
-        chatId: policySource('chatId'),
+        sessionId: policySource('sessionId') ?? event.sessionId,
+        channel: policySource('channel') ?? event.channel,
+        accountId: policySource('accountId') ?? event.accountId,
+        userId: policySource('userId') ?? event.userId,
+        chatId: policySource('chatId') ?? event.chatId,
         policyVersion: event.policyVersion,
         expiresAt: Math.min(
           basePolicy.expiresAt !== null && Number.isFinite(Number(basePolicy.expiresAt)) ? Number(basePolicy.expiresAt) : Infinity,

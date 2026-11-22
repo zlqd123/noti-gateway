@@ -6,7 +6,7 @@ import { toInboundChannelName } from './capability-matrix.mjs'
 import { deleteDurable, setDurable } from './store.mjs'
 import { isPublicExposure } from '../security/exposure.mjs'
 import { splitSecretPatch } from '../security/secret-patch.mjs'
-import { inboundApplyMode, isHotApplied } from '../control-surface/apply-mode.mjs'
+import { inboundApplyMode, isHotApplied } from '../assembly/apply-mode.mjs'
 
 /** 入站通道的凭证字段表（与 Admin 既有表一致；wechat 为扫码产物，不手填）。 */
 export const INBOUND_FIELDS = Object.freeze({
