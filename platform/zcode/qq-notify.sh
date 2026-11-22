@@ -1,30 +1,29 @@
 #!/usr/bin/env bash
 # ZCode hook 通知脚本（QQ 官方机器人，C2C 单聊）
+# 接入协议/端点/HMAC 签名速记：同目录《接入文档.md》（noti-gateway 仓库根同名文件）
 #   无参数        → Stop 事件：任务完成，发文本通知
 #   参数 ask      → PermissionRequest 事件：发带「允许/拒绝」回调按钮的提问卡片，
-#                   等待你在 QQ 里点击按钮（点击事件由 qq-bot-listener.py 经 WebSocket 长连接推回本机，不打开链接，手机在外网也能点）
+#                   等待你在 QQ 里点击按钮。按钮点击经网关 SSE 事件订阅接收：
+#                   常驻监听在线就用它，否则钩子现场拉起一次性监听器
+#                   qq-ask-once.py（先等 SSE 就绪再发卡片，收完点击即退出）——
+#                   不打开链接，手机在外网也能点，且无需开机启动任何服务
 # 说明：
 #   - 永远 exit 0（exit 2 会直接拒绝请求）；stdout 只输出决策 JSON（hook 会解析）
-#   - 日志: ~/.zcode/qq-notify.log；token 缓存: ~/.zcode/.qq-bot-token.cache
+#   - 日志: ~/.zcode/log/qq-notify-<日期>.log（一天一个文件）
 #   - Windows 下非 ASCII 不能走命令行参数，JSON 一律先写文件再 --data-binary 发送
 
 # ==================== 在这里填你的配置 ====================
-APPID="<在 q.qq.com 开放平台-开发设置 获取>"
-CLIENT_SECRET="<同页 AppSecret，勿外泄>"
-USER_OPENID="<你的用户openid：私聊机器人一次，从 C2C_MESSAGE_CREATE 事件里取>"  # 用户 openid：私聊机器人一次，从 C2C_MESSAGE_CREATE 事件里取
-PING_URL="http://127.0.0.1:39527"  # qq-bot-listener.py 的健康检查地址
+PING_URL="http://127.0.0.1:39527"  # 常驻监听（qq-bot-listener.py，可选）健康检查地址；不在线则按需拉起一次性监听器
 WAIT_SECONDS=90                     # 最多等按钮点击的秒数，超时回退到 ZCode 本地确认框
-GATEWAY_URL="${GATEWAY_URL:-http://<网关地址>}"        # noti-gateway 地址（按自己的部署填写）；置空则任务完成通知直连 QQ
+GATEWAY_URL="${GATEWAY_URL:-http://<网关地址>}"        # 阿里云 noti-gateway
 GATEWAY_KEY_ID="${GATEWAY_KEY_ID:-zcode}"                       # 网关 keys.conf 里的密钥代号
-GATEWAY_SECRET="${GATEWAY_SECRET:-<网关 keys.conf 里对应 hmac 行的 secret>}"  # HMAC 签名密钥（v1）
+GATEWAY_SECRET="${GATEWAY_SECRET:-<网关 keys.conf 里 zcode 行的 HMAC secret>}"  # keys.conf zcode 行（HMAC v1，唯一鉴权方式）
 # =========================================================
 
-TOKEN_URL="https://api.bot.qq.com/app/getAppAccessToken"
-API_BASE="https://api.sgroup.qq.com"
-SEND_URL="${API_BASE}/v2/users/${USER_OPENID}/messages"
+# 直连 QQ 的 TOKEN_URL/SEND_URL 已下线（2026-11-22）：所有发送统一走网关 raw_qq/通知接口
 
-CACHE_FILE="$HOME/.zcode/.qq-bot-token.cache"
 RESP_FILE="$HOME/.zcode/.qq-notify-resp"
+RAW_BODY_FILE="$HOME/.zcode/.qq-notify-rawbody"
 PAYLOAD_FILE="$HOME/.zcode/.qq-notify-payload"
 LOG_DIR="$HOME/.zcode/log"          # 日志目录：一天一个文件
 
@@ -40,35 +39,11 @@ trap 'log "退出 code=$?"' EXIT
 
 # 代理免疫：本机装有 GHelper/clash 等代理，宿主进程可能给钩子注入代理变量；
 # 网关和 QQ API 均为国内直连地址，走代理反而超时（10s curl 上限 → 钩子失败）
-export NO_PROXY="${NO_PROXY:+$NO_PROXY,}<网关域名>,api.bot.qq.com,api.sgroup.qq.com,bots.qq.com"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}<网关域名>"
 export no_proxy="$NO_PROXY"
 
-if [[ "$APPID" == 请替换* || "$CLIENT_SECRET" == 请替换* || "$USER_OPENID" == 请替换* ]]; then
-  exit 0
-fi
-
-# ---------- 1. 获取 access_token（优先用缓存） ----------
+# ---------- 1. （直连 QQ 已下线；QQ access_token 由网关侧统一获取） ----------
 now=$(date +%s)
-token=""
-if [[ -f "$CACHE_FILE" ]]; then
-  read -r cached_token cached_exp < "$CACHE_FILE" 2>/dev/null
-  if [[ -n "${cached_token:-}" && -n "${cached_exp:-}" ]] && (( cached_exp - now > 0 )); then
-    token="$cached_token"
-  fi
-fi
-if [[ -z "$token" ]]; then
-  resp=$(curl -s -m 10 -X POST "$TOKEN_URL" \
-    -H "Content-Type: application/json" \
-    -d "{\"appId\":\"$APPID\",\"clientSecret\":\"$CLIENT_SECRET\"}")
-  token=$(printf '%s' "$resp" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  expires_in=$(printf '%s' "$resp" | sed -n 's/.*"expires_in"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9]*\).*/\1/p')
-  if [[ -z "$token" ]]; then
-    log "获取 access_token 失败，响应: ${resp:0:300}"
-    exit 0
-  fi
-  expires_in=${expires_in:-7200}
-  echo "$token $(( now + expires_in - 300 ))" > "$CACHE_FILE"
-fi
 
 # ---------- 2. 公共函数 ----------
 json_escape() {  # 转成可安全放进 JSON 字符串的形式
@@ -79,17 +54,41 @@ json_escape() {  # 转成可安全放进 JSON 字符串的形式
 
 seq=$(((RANDOM << 15) + RANDOM + now % 100000 + 1))   # msg_seq，全局起始值
 
-send_payload() {  # 发送 $PAYLOAD_FILE；成功返回 0，失败记日志并返回 1
-  local code body
-  code=$(curl -s -m 10 -o "$RESP_FILE" -w '%{http_code}' -X POST "$SEND_URL" \
-    -H "Authorization: QQBot $token" \
+# 结束本钩子自己拉起的一次性监听器（按 PID，只杀自己启动的进程；ask/choice 两模式共用）
+listener_pid=""
+ready_file=""
+kill_listener() {
+  if [[ -n "$listener_pid" ]]; then
+    kill "$listener_pid" 2>/dev/null
+    wait "$listener_pid" 2>/dev/null
+    listener_pid=""
+  fi
+  [[ -n "$ready_file" ]] && rm -f "$ready_file"
+}
+
+send_payload() {  # 经网关 raw_qq 透传发送 $PAYLOAD_FILE；成功返回 0，失败记日志并返回 1
+  # msg_id/msg_seq 等被动字段在载荷内原样透传；网关负责转换成 QQ 官方通道发送
+  { printf '{"raw_qq":'; cat "$PAYLOAD_FILE"; printf '}'; } > "$RAW_BODY_FILE"
+  local resp ts nonce sha sig p="/n/zcode" canonical
+  ts=$(date +%s)
+  nonce=$(openssl rand -hex 8 2>/dev/null || printf '%s%06d' "$ts" "$RANDOM$RANDOM")
+  sha=$(openssl dgst -sha256 -r "$RAW_BODY_FILE" | awk '{print $1}')
+  canonical="POST
+$p
+$ts
+$nonce
+$sha"
+  sig=$(printf '%s' "$canonical" | openssl dgst -sha256 -hmac "$GATEWAY_SECRET" | awk '{print $NF}')
+  resp=$(curl -s -m 30 -X POST "$GATEWAY_URL$p?wait=1" \
     -H "Content-Type: application/json; charset=utf-8" \
-    --data-binary @"$PAYLOAD_FILE")
-  body=$(head -c 500 "$RESP_FILE" 2>/dev/null)
-  if [[ "$code" == 2* && "$body" != *'"err_code"'* && "$body" != *'"code"'* ]]; then
+    -H "X-Noti-Signature: v1=$sig" -H "X-Noti-Timestamp: $ts" \
+    -H "X-Noti-Nonce: $nonce" -H "X-Noti-Key-Id: $KEY_ID" \
+    --data-binary @"$RAW_BODY_FILE")
+  printf '%s' "$resp" > "$RESP_FILE"
+  if [[ "$resp" == *'"ok":true'* && "$resp" == *'"qq:me":{"ok":true'* ]]; then
     return 0
   fi
-  log "发送失败 HTTP $code 响应: $body"
+  log "网关投递失败: ${resp:0:300}"
   return 1
 }
 
@@ -98,21 +97,45 @@ dir_e=$(json_escape "$dir")
 
 # ---------- 3a. 提问模式：发卡片并等待按钮点击 ----------
 if [[ "${1:-}" == "ask" ]]; then
-  # 应答服务不在线就只发纯文本提示，立即回退到本地确认框（不空等）
-  if ! curl -s -m 2 "${PING_URL}/ping" | grep -q pong; then
-    msg=$(json_escape "❓ Zcode 请求权限确认 $(date '+%H:%M:%S')（本地应答服务未启动，按钮不可用）")
-    printf '{"msg_type":0,"content":"%s","msg_seq":%s}' "$msg" "$seq" > "$PAYLOAD_FILE"
-    send_payload
+  # 从 hook stdin 的 JSON 里提取工具名和命令摘要
+  if [[ -t 0 ]]; then input=""; else input=$(head -c 4096 2>/dev/null); fi
+  tool=$(printf '%s' "$input" | sed -n 's/.*"tool_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
+  cmd=$(printf '%s' "$input" | sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
+
+  # 选择题有自己的钩子（PreToolUse/choice 分支）。AskUserQuestion 会同时触发
+  # PermissionRequest，若此处再拦会双重扣住同一工具调用（实测先 600s 再 49s），直接放行
+  if [[ "$tool" == "AskUserQuestion" ]]; then
+    log "ask: 工具为 AskUserQuestion，交由 choice 钩子处理，本钩子放行"
     exit 0
   fi
 
   rid="$(date +%s)x$RANDOM"
   answer_file="$HOME/.zcode/.qq-answer-$rid"
+  ready_file="$HOME/.zcode/.qq-ws-ready-$rid"
+  rm -f "$answer_file" "$ready_file"
 
-  # 从 hook stdin 的 JSON 里尽力提取工具名和命令摘要
-  if [[ -t 0 ]]; then input=""; else input=$(head -c 4096 2>/dev/null); fi
-  tool=$(printf '%s' "$input" | sed -n 's/.*"tool_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
-  cmd=$(printf '%s' "$input" | sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
+  # 按钮点击事件经 WebSocket 长连接接收：常驻监听在线就用它；
+  # 不在线则现场拉起一次性监听器（先等 WS 就绪再发卡片，防止点击落在无连接窗口丢失）。
+  # 一次性监听器随本钩子退出，不常驻、无需开机启动。
+  listener_pid=""
+  if curl -s -m 2 "${PING_URL}/ping" | grep -q pong; then
+    log "常驻监听在线，直接使用"
+  else
+    python "$HOME/.zcode/qq-ask-once.py" "$rid" "$((WAIT_SECONDS + 15))" \
+      </dev/null >> "$LOG_DIR/qq-ask-once-run.log" 2>&1 &
+    listener_pid=$!
+    ready_waited=0
+    while (( ready_waited < 12 )) && [[ ! -f "$ready_file" ]]; do
+      sleep 1
+      ready_waited=$((ready_waited + 1))
+    done
+    if [[ ! -f "$ready_file" ]]; then
+      log "按需监听器未就绪（${ready_waited}s），不发卡片，回退本地确认框"
+      kill_listener
+      exit 0
+    fi
+    log "按需监听器就绪（${ready_waited}s）"
+  fi
 
   card="❓ **Zcode 请求权限确认**"$'\n'"🕐 $(date '+%H:%M:%S')"
   [[ -n "$dir" ]] && card+=$'\n'"📁 $dir"
@@ -120,24 +143,17 @@ if [[ "${1:-}" == "ask" ]]; then
   [[ -n "$cmd" ]] && card+=$'\n'"💻 ${cmd:0:100}"
   card_e=$(json_escape "$card")
 
-  # 第一优先：Markdown 卡片 + 允许/拒绝回调按钮（点击不打开链接，事件推送到 WebSocket 监听服务）
+  # Markdown 卡片 + 允许/拒绝回调按钮（点击不打开链接，事件推送到 WebSocket 监听服务）
   printf '{"msg_type":2,"markdown":{"content":"%s"},"keyboard":{"content":{"rows":[{"buttons":[{"id":"1","render_data":{"label":"✅ 允许","visited_label":"已允许","style":1},"action":{"type":1,"data":"allow:%s","permission":{"type":2}}},{"id":"2","render_data":{"label":"❌ 拒绝","visited_label":"已拒绝","style":0},"action":{"type":1,"data":"deny:%s","permission":{"type":2}}}]}]}},"msg_seq":%s}' \
     "$card_e" "$rid" "$rid" "$seq" > "$PAYLOAD_FILE"
   if ! send_payload; then
-    seq=$((seq + 1))
-    # 降级二：纯文本 + 按钮
-    printf '{"msg_type":0,"content":"%s","keyboard":{"content":{"rows":[{"buttons":[{"id":"1","render_data":{"label":"✅ 允许","visited_label":"已允许","style":1},"action":{"type":1,"data":"allow:%s","permission":{"type":2}}},{"id":"2","render_data":{"label":"❌ 拒绝","visited_label":"已拒绝","style":0},"action":{"type":1,"data":"deny:%s","permission":{"type":2}}}]}]}},"msg_seq":%s}' \
-      "$card_e" "$rid" "$rid" "$seq" > "$PAYLOAD_FILE"
-    if ! send_payload; then
-      seq=$((seq + 1))
-      # 降级三：纯文本（按钮不可用）
-      printf '{"msg_type":0,"content":"%s","msg_seq":%s}' "$card_e" "$seq" > "$PAYLOAD_FILE"
-      send_payload
-      exit 0  # 没按钮可点，直接回退本地确认框
-    fi
+    # 不降级纯文本：卡片发不出就放弃远程代答，回退本地确认框
+    log "markdown 卡片发送失败，放弃远程代答"
+    kill_listener
+    exit 0
   fi
 
-  # 等待按钮点击（qq-answer-server.py 写入应答文件）
+  # 等待按钮点击（常驻监听或一次性监听器写入应答文件）
   waited=0
   while (( waited < WAIT_SECONDS )); do
     if [[ -f "$answer_file" ]]; then
@@ -145,6 +161,7 @@ if [[ "${1:-}" == "ask" ]]; then
       rm -f "$answer_file"
       if [[ "$ans" == "allow" || "$ans" == "deny" ]]; then
         printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"%s"}}' "$ans"
+        kill_listener
         exit 0
       fi
     fi
@@ -152,7 +169,81 @@ if [[ "${1:-}" == "ask" ]]; then
     waited=$((waited + 2))
   done
   # 超时：不输出决策，回退到 ZCode 本地确认框
+  kill_listener
   exit 0
+fi
+
+# ---------- 3a3. 选择题模式（PreToolUse/AskUserQuestion）----------
+# ZCode 的选择题不走 PermissionRequest（工具自动放行，问题挂在 UI 上等人答）。
+# 默认=挂起模式（可靠）：钩子按住工具调用，QQ 卡片等你应答，答案经 exit 2+reason
+#   喂回同一轮继续；超时（默认 600s，~/.zcode/qq-choice-hold-seconds 可调）放行本地 UI。
+#   注意：挂起期间本地不出题（工具未执行），QQ 桌面端/手机端均可作答。
+# 可选=双端并行（本地 UI 立即出现 + QQ 卡片；但 QQ 端答案靠注入 ZCode 输入框发送——
+#   实测不可靠：文本会落在焦点所在的任意会话且回车不一定发送）：
+#   建 ~/.zcode/hooks/QQ-CHOICE-DUAL 旗标启用。
+# 停用全部：建空文件 ~/.zcode/hooks/DISABLE-QQ-CHOICE
+if [[ "${1:-}" == "choice" ]]; then
+  if [[ -f "$HOME/.zcode/hooks/DISABLE-QQ-CHOICE" ]]; then exit 0; fi
+  input=""
+  if [[ ! -t 0 ]]; then input=$(head -c 65536 2>/dev/null); fi
+
+  # 解析 questions + 会话 id → 计划文件（CHOICE / SID / Q 行）
+  input_file="$HOME/.zcode/.qq-choice-input"
+  plan_file="$HOME/.zcode/.qq-choice-plan"
+  printf '%s' "$input" > "$input_file"
+  python "$HOME/.zcode/qq-choice-parse.py" "$input_file" > "$plan_file" 2>/dev/null
+  rm -f "$input_file"
+  head -1 "$plan_file" | grep -q '^CHOICE$' || exit 0
+
+  sid=$(awk -F'\t' '$1 == "SID" {print $2; exit}' "$plan_file")
+  rid="$(date +%s)x$RANDOM"
+
+  # —— 挂起模式（默认）——
+  if [[ ! -f "$HOME/.zcode/hooks/QQ-CHOICE-DUAL" ]]; then
+    hold_s=600
+    if [[ -f "$HOME/.zcode/qq-choice-hold-seconds" ]]; then
+      hold_s=$(head -1 "$HOME/.zcode/qq-choice-hold-seconds" | tr -cd '0-9')
+      [[ "$hold_s" =~ ^[0-9]+$ ]] && (( hold_s >= 30 )) || hold_s=600
+    fi
+    answer_file="$HOME/.zcode/.qq-answer-$rid"
+    ready_file="$HOME/.zcode/.qq-ws-ready-$rid"
+    rm -f "$answer_file" "$ready_file"
+
+    log "choice: 挂起模式——按住 ${hold_s}s 等 QQ 应答（rid=$rid）"
+    # choice 子模式下卡片由 python 自行发送（READY 后直接发，无就绪文件），只等应答文件
+    python "$HOME/.zcode/qq-ask-once.py" choice "$rid" "$hold_s" "$plan_file" \
+      </dev/null >> "$LOG_DIR/qq-ask-once-run.log" 2>&1 &
+    listener_pid=$!
+
+    waited=0
+    while (( waited < hold_s + 15 )); do
+      [[ -f "$answer_file" ]] && break
+      kill -0 "$listener_pid" 2>/dev/null || break  # 监听器异常退出（卡片未发出等）
+      sleep 2
+      waited=$((waited + 2))
+    done
+    kill_listener
+
+    if [[ -f "$answer_file" ]]; then
+      ans=$(cat "$answer_file" 2>/dev/null)
+      rm -f "$answer_file"
+      if [[ -n "$ans" ]]; then
+        reason="用户已通过 QQ 远程回答了你的提问（$(date '+%H:%M:%S')）：${ans}。请直接依据该回答继续后续工作，不要再次询问。"
+        log "choice: 挂起解除，已代答 -> ${ans:0:60}"
+        printf '%s' "$reason" >&2
+        exit 2  # deny：AskUserQuestion 不落地，reason 携带答案回给同一轮的模型
+      fi
+    fi
+    log "choice: 超时无人应答，放行走本地 UI"
+    exit 0
+  fi
+
+  # —— 双端并行模式（opt-in，QQ-CHOICE-DUAL 旗标）——本地 UI 照常出题，QQ 卡片由分离式监视器负责
+  log "choice: 双端并行（opt-in）——钩子放行走本地 UI，分离式监视器发 QQ 卡片（rid=$rid）"
+  python "$HOME/.zcode/qq-choice-watch.py" "$sid" "$rid" "$plan_file" \
+    </dev/null >> "$LOG_DIR/qq-choice-watch-run.log" 2>&1 &
+  disown
+  exit 0  # 本地 UI 立即出现；QQ 端由监视器负责，30 分钟内远程代答有效
 fi
 
 # ---------- 3a2. 测试模式：多选项 + 自定义回答卡片 ----------
@@ -202,10 +293,18 @@ if [[ "${1:-}" == "test" ]]; then
   exit 0
 fi
 
-# ---------- 3b. 任务完成模式：优先走 noti-gateway（持久化/重试/配额保护），失败直连兜底 ----------
+# ---------- 3b. 任务完成模式：文本走网关通知接口；失败换 raw_qq 卡片通道重发 ----------
 # 会话标识：钩子环境注入 CLAUDE_SESSION_ID；兜底从 stdin JSON 提取
 input=""
 if [[ ! -t 0 ]]; then input=$(head -c 4096 2>/dev/null); fi
+
+# 载荷采样：保存最近 10 次 Stop 的原始 stdin JSON，用于区分主会话/子任务事件
+if [[ -n "$input" ]]; then
+  mkdir -p "$LOG_DIR"
+  printf '%s' "$input" > "$LOG_DIR/stop-payload-$(date +%s%3N).json"
+  ls -t "$LOG_DIR"/stop-payload-*.json 2>/dev/null | tail -n +11 | xargs -r rm -f
+fi
+
 sid="${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}"
 if [[ -z "$sid" ]]; then
   sid=$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
@@ -228,10 +327,10 @@ fi
 title=""
 if [[ -n "$sid" ]]; then
   title=$(python - "$sid" <<'PYEOF'
-import sqlite3, sys
+import os, sqlite3, sys
 try:
     db = sqlite3.connect(
-        r'file:' + os.path.expanduser('~') + '/.zcode/v2/tasks-index.sqlite?mode=ro',
+        'file:' + os.path.expanduser('~') + '/.zcode/v2/tasks-index.sqlite?mode=ro',
         uri=True, timeout=2)
     row = db.execute(
         "SELECT title FROM tasks WHERE task_id=? AND deleted=0",
@@ -274,7 +373,7 @@ if [[ -n "$GATEWAY_URL" ]]; then
   if [[ "$gw_code" == 20* ]]; then
     exit 0   # 202=已入队落盘，网关负责投递；200=同步成功
   fi
-  log "网关投递失败 HTTP $gw_code，回退直连 QQ"
+  log "网关文本投递失败 HTTP $gw_code，换 raw_qq 通道重发"
 fi
 
 msg_e=$(json_escape "$msg")

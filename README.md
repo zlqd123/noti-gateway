@@ -1,6 +1,6 @@
 # noti-gateway
 
-统一通知网关。**一个端口（默认 `10086`）同时接收 curl / HTTP / Webhook / WebSocket 上行，并提供 SSE 事件订阅流**，支持多个客户端并发长连接，按配置扇出到 **QQ 官方机器人 / 任意 Webhook / 出站 WebSocket 连接池**。
+统一通知网关。**一个端口（默认 `10086`）同时接收 curl / HTTP / Webhook / WebSocket / 文件分片上行，并提供 SSE 事件订阅流**（出站回执 + QQ 入站消息/按钮回调），支持多个客户端并发长连接，按配置扇出到 **QQ 官方机器人（文本/markdown/ark/raw 透传/图片文件视频音频）/ 任意 Webhook / 出站 WebSocket 连接池**。
 
 > 接入方式、连接协议细节、服务器部署与排错见 **[接入文档.md](接入文档.md)**。
 
@@ -20,7 +20,7 @@
 ```bash
 cd noti-gateway
 pip install -r requirements.txt
-cp config.example.yaml config.yaml   # 然后填 auth.token / qq.app_id / qq.client_secret / group_openid
+cp config.example.yaml config.yaml   # 然后填 keys.conf 密钥表（HMAC v1）与 bots 段（app_id / client_secret / targets.user_openid）
 python -m noti_gateway.server
 ```
 
@@ -52,43 +52,45 @@ WantedBy=multi-user.target
 
 ## 调用方式
 
-> **鉴权注意**：项目已从共享 Token 迁移到 **HMAC v1 签名**（密钥表 `keys.conf` 实时读取，
-> 随时增删改即生效，详见 `接入文档.md` §3）。下文示例中的 `Authorization: Bearer` 写法
-> 是迁移前的旧文档，实际调用一律按 HMAC 签名；签名代码见接入文档 §3 的速记模板。
+> **鉴权**：**HMAC v1 签名**为主（密钥表 `keys.conf` 实时读取，随时增删改即生效，
+> 详见 `接入文档.md` §3）；共享 Token（`auth.token` + `allow_query_token`）作为兼容保留。
+> 签名速记模板见接入文档 §3。
 
 ### curl（最常见）
 
 ```bash
 # 异步：立刻返回 202，消息已落盘，网关后台慢慢发
-curl -X POST "http://IP:10086/n/ci" \
-     -H "Authorization: Bearer <token>" \
-     -H "X-Source: ci" \
-     -d "构建失败"
+body=$(printf '%s' "构建失败"); ts=$(date +%s); nonce=$(openssl rand -hex 8)
+sig=$(printf 'POST\n/n/ci\n%s\n%s\n%s' "$ts" "$nonce" \
+      "$(printf '%s' "$body" | sha256sum | awk '{print $1}')" \
+      | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+curl -X POST "http://IP:10086/n/ci" --data-binary "$body" -H "X-Source: ci" \
+     -H "X-Noti-Signature: v1=$sig" -H "X-Noti-Timestamp: $ts" \
+     -H "X-Noti-Nonce: $nonce" -H "X-Noti-Key-Id: zcode"
 
-# 同步：等平台真实回执，拿到每个 target 的成败
-curl -X POST "http://IP:10086/n/ci?wait=1" \
-     -H "Authorization: Bearer <token>" -H "X-Source: ci" \
-     -d "构建失败"
-# => {"ok":false,"results":{"qq:default":{"ok":false,"code":100001,...}}}
+# 同步：?wait=1 等平台真实回执，拿到每个 target 的成败（签名同上，略）
+# => {"ok":true,"results":{"qq:me":{"ok":true,"code":0,...}}}
 
-# token 走 query（不想改调用方脚本时）
+# 兼容：token 走 query（配置 auth.token + allow_query_token 后可用）
 curl "http://IP:10086/n/ci?token=<token>&level=error&title=标题" -d "正文"
 ```
 
 ### JSON / 表单 / 纯文本都吃
 
 ```bash
+# 以下示例省略 HMAC 鉴权头（同上）
+
 # JSON
-curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" -H "X-Source: ci" \
+curl -X POST "http://IP:10086/n/ci" -H "X-Source: ci" \
      -H "Content-Type: application/json" \
      -d '{"level":"error","title":"MySQL 主库宕机","body":"10.0.0.5:3306","tags":["prod"]}'
 
 # 表单
-curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" \
+curl -X POST "http://IP:10086/n/ci" \
      -d "title=磁盘将满&body=/dev/sda1 91%"
 
 # 纯文本：第一行当标题，其余当正文
-curl -X POST "http://IP:10086/n/ci" -H "Authorization: Bearer <t>" \
+curl -X POST "http://IP:10086/n/ci" \
      -H "Content-Type: text/plain" --data-binary $'备份完成\n耗时 12m'
 ```
 
@@ -111,7 +113,29 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data)); // {"event_id":"...","que
 
 ### SSE 订阅流
 
-`GET /stream?token=<t>` 以 `text/event-stream` 实时推送 `submitted / receipt / dead / suppressed` 事件，可用 `&source=` `&types=` 过滤，浏览器 `EventSource` 原生可用。
+`GET /stream` 以 `text/event-stream` 实时推送事件，`&types=`（逗号分隔）与 `&source=` 过滤，浏览器 `EventSource` 原生可用：
+
+| types | 内容 |
+|---|---|
+| `submitted / receipt / dead / suppressed` | 出站投递流水（入队/回执/死信/抑制） |
+| `reminder` | 定时提醒 fired / missed / error |
+| `qq_event` | **QQ 入站事件**：C2C 消息、群 @ 消息、按钮回调 INTERACTION_CREATE（回调回应由网关自动完成，QQ 客户端不转圈） |
+
+`qq_event` 事件负载：`{"event": "INTERACTION_CREATE", "bot": "<appid>", "data": {原始 dispatch}}`。监听类调用方订阅它即可实现"按钮点击 → 本地动作"的零直连闭环，完整示例见 `platform/zcode/qq-bot-listener.py`。
+
+## 文件与消息投递（对接 QQ）
+
+**接收入口**（多种形态，统一持久化后转换发送）：
+
+| 入口 | 用法 | 适用 |
+|---|---|---|
+| 内联文件 | `/n/{route}` body 带 `file.b64`（请求体 ≤16MB） | 常规小文件 |
+| 分片收件 | `/u/init` → `/u/{id}/part/{i}` → `/u/{id}/complete`，再 `file.ref` 引用发送 | 大文件（≤190MB） |
+| multipart | `/n/{route}` 或 `/f/{src}` 以 `multipart/form-data` 传文件+字段 | curl -F / 现成工具 |
+| 裸二进制 | `POST /f/{src}?name=a.zip&mime=...`，body 为原始字节；`&send=1&title=...` 直接构造成通知发送 | 脚本直传 |
+| URL 代下载 | `file.url` 填 http(s) 地址，网关代下载后转存发送 | 对端只有下载链接 |
+
+**发送到 QQ**：任意入口的文件统一转换成官方机器人可接受的通道——≤5MB 先走 sgroup `/files` 直传，失败自动降级 `upload_prepare → PUT 分片 → part_finish → /files 合并`（image/video/audio/file 全覆盖，`msg_type=7` 富媒体）。消息类型支持 `msg_type 0/2/3/4/7`：文本、markdown+keyboard 按钮卡、模板 markdown、ark、`raw_qq` 原始载荷透传。端点细节见 `接入文档.md` §2.6。
 
 ## 返回码含义
 
@@ -193,8 +217,9 @@ chatdownload 订阅其广播的 `C2C_MESSAGE_CREATE` 事件（同一份 access_t
 **连接与业务分层**（机制借鉴 NoneBot / Koishi / AstrBot，全程无 AI）：
 
 - **`qqws`** 独占 QQ 官方 WS 长连接（一个 appid 只有一条事件流，必须收口）：
-  连接/心跳/重连/Resume，收到 dispatch 事件后广播给 `ctx.event_listeners`，
-  并登记 msg_id 供**被动回复**；
+  连接/心跳/重连/Resume，收到 dispatch 事件后广播给 `ctx.event_listeners`
+  （C2C/群@消息与按钮回调同时经 hub 以 `qq_event` 广播给 SSE 订阅者，按钮回调的
+  PUT /interactions 回应由网关自动完成），并登记 msg_id 供**被动回复**；
 - **其他插件都是纯消费者**：chatdownload 订阅事件做归档；reminders 等用
   **声明式指令**做交互——彼此互不感知、可插拔；
 - **声明式指令（学 Koishi）**：`ctx.command("提醒", hint="<时间> <内容>",
@@ -291,20 +316,41 @@ DELETE /schedule/{id}            取消
 - 时间统一东八区，不依赖服务器系统时区；cron 为 5 段常用子集（`*/步长`、列表、区间、日与周「或」语义），由内置 120 行引擎解析，无新依赖；
 - 事件进 SSE：`GET /stream?types=reminder` 可订阅 fired/missed/error。
 
+## ZCode 钩子脚本（platform/zcode/）
+
+本机 ZCode 钩子套件，全部只与网关对话（**零 QQ 直连**；密钥经环境变量注入，仓库副本为占位符）：
+
+| 脚本 | 职责 |
+|---|---|
+| `qq-notify.sh` | 任务完成通知 / 权限确认卡（允许·拒绝回调按钮）/ 选择题远程代答（挂起等 QQ 应答） |
+| `qq-bot-listener.py` | 常驻 SSE 监听（`/stream?types=qq_event`）：写按钮点击与消息文件供钩子轮询 |
+| `qq-ask-once.py` | 一次性监听器：先等 SSE 就绪再发多题按钮卡（多选累加 / 自定义回答），收齐即退出 |
+| `qq-send-file.sh` | 发文件：≤12MB 内联 b64，更大走 `/u/*` 分片，再经 `/n/zcode` 引用发送 |
+| `qq-choice-parse.py` / `qq-choice-watch.py` | 选择题解析与双端并行监视（opt-in） |
+| `hooks/` | 会话回合监视等 ZCode hook 机制脚本 |
+
+接入协议、HMAC 签名速记与端点一览见 `接入文档.md`。
+
 ## 已知边界
 
 - **单机单实例**设计。队列是本地 SQLite，多副本部署需要换 Redis。
 - 关闭时会排空队列（`TimeoutStopSec` 要给够时间），但排空超时后未发完的会留在 SQLite 里，下次启动自动恢复。
-- QQ **频道（子频道）** 场景官方要求机器人保持 WebSocket 在线。单聊收消息已由 chatdownload 实现（Gateway 收事件）；群聊 @机器人 消息、按钮交互、频道消息仍未接。
+- QQ **频道（子频道）** 场景官方要求机器人保持 WebSocket 在线。单聊收消息（chatdownload 归档）、群聊 @机器人 消息、按钮交互（INTERACTION 自动回应 + `qq_event` 广播）已接；频道消息仍未接。
 - 鉴权为 HMAC 多密钥签名（`keys.conf` 实时生效）；来源 IP 白名单 `auth.ip_allow` 公网部署建议开启。
 
 ## 测试
 
 ```bash
-python tests/selftest.py          # 全链路 25 项：鉴权/异步/同步/WS池/去重/路由/格式/回执
-python tests/test_retry.py        # 重试与死信语义 9 项
-python tests/test_connections.py  # 多客户端并发/心跳/批量/_wait/SSE 22 项
-python tests/test_reminders.py    # 定时提醒 58 项：解析/cron/HTTP全链路/命令/错过补发
+python tests/selftest.py              # 全链路 25 项：鉴权/异步/同步/WS池/去重/路由/格式/回执
+python tests/test_retry.py            # 重试与死信语义 9 项
+python tests/test_connections.py      # 多客户端并发/心跳/批量/_wait/SSE 22 项
+python tests/test_reminders.py        # 定时提醒 58 项：解析/cron/HTTP全链路/命令/错过补发
+python tests/test_media.py            # 富媒体：内联/分片/双通道上传与降级
+python tests/test_receive_variants.py # 接收形态 13 段：multipart/裸二进制/url 代下载/GBK 字段
+python tests/test_qq_events.py        # qq_event：fake QQ WS → SSE 广播 + 交互自动回应
+python tests/test_auth.py             # HMAC v1：canonical/防重放/多密钥
+python tests/test_config_bots.py      # bots/targets 配置解析
+python tests/test_dispatch_order.py   # 多 target 分发顺序与保序
 ```
 
-四个测试都自带 mock 服务，不需要真实 QQ 凭证、不需要联网。
+全部自带 mock 服务，不需要真实 QQ 凭证、不需要联网。

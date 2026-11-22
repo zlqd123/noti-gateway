@@ -8,7 +8,9 @@
             {
               "type": "process",
               "command": "<bash.exe 绝对路径，如 D:/net/Git/bin/bash.exe —— 钩子运行器不解析裸命令>",
-              "args": ["<本脚本部署路径>/qq-notify.sh"],
+              "args": [
+                "<本脚本部署路径>/qq-notify.sh"
+              ],
               "timeoutMs": 20000,
               "statusMessage": "发送 QQ 通知"
             }
@@ -21,9 +23,46 @@
             {
               "type": "process",
               "command": "<同上 bash.exe 绝对路径>",
-              "args": ["<同上>/qq-notify.sh", "ask"],
+              "args": [
+                "<同上>/qq-notify.sh",
+                "ask"
+              ],
               "timeoutMs": 110000,
               "statusMessage": "等待 QQ 按钮确认"
+            }
+          ]
+        }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "<bash.exe 绝对路径，如 D:/net/Git/bin/bash.exe —— 钩子运行器不解析裸命令>",
+              "enabled": true,
+              "statusMessage": "启动轮次监视器",
+              "args": [
+                "<同上>/部署目录，如 C:/Users/<你>/.zcode/hooks/run-watch.sh"
+              ],
+              "timeoutMs": 10000
+            }
+          ]
+        }
+      ],
+      "PreToolUse": [
+        {
+          "matcher": "AskUserQuestion",
+          "hooks": [
+            {
+              "type": "process",
+              "command": "<bash.exe 绝对路径，如 D:/net/Git/bin/bash.exe —— 钩子运行器不解析裸命令>",
+              "enabled": true,
+              "statusMessage": "QQ 远程选择题",
+              "args": [
+                "<同上>/部署目录，如 C:/Users/<你>/.zcode/qq-notify.sh",
+                "choice"
+              ],
+              "timeoutMs": 660000
             }
           ]
         }
