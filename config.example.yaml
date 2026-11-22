@@ -125,3 +125,17 @@ webchat:
   max_per_chat: 300          # 每会话内存保留条数
   persist: true              # jsonl 落盘（重启恢复最近历史）
   data_dir: "webchat"        # 落盘目录（相对运行目录）
+
+# --- 服务器看门狗（可选）：内存/交换/磁盘/CPU 超阈值告警 + 恢复通知 ---
+# plugins 清单加 "watchdog" 启用；告警经 Dispatcher 投递（复用路由/静默/限流）
+# watchdog:
+#   enabled: true
+#   mem_pct: 85              # 内存告警线（%）
+#   swap_pct: 70             # 交换分区告警线
+#   cpu_pct: 90              # CPU 告警线
+#   disk_pct: 90             # 根分区告警线
+#   disks: {"/data": 85}     # 额外挂载点: 告警线
+#   check_interval: 60       # 采样周期（秒，最低 15）
+#   confirm: 3               # 连续 N 次超标才告警（去抖）
+#   recover_confirm: 5       # 连续 N 次回落才报恢复
+#   proc_top: 5              # 内存告警时附 TOP N 进程

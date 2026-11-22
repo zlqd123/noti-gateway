@@ -50,6 +50,7 @@ from ..dispatcher import Dispatcher, SubmitError
 from ..models import Notification
 from . import PluginMeta
 from ._cron import TZ_CN, cron_human, cron_next, parse_cron
+from . import _holidays
 
 log = logging.getLogger("noti.reminders")
 
@@ -854,6 +855,32 @@ class ReminderStore:
 # --------------------------------------------------------------------------
 # 插件：调度循环 + HTTP API + QQ 命令
 # --------------------------------------------------------------------------
+# ---------------- 工作日类提醒：节假日感知（_holidays 数据源）----------------
+
+def _run_day(d: datetime.date) -> bool:
+    """某日是否为工作日：节假日表优先（含调休补班），无数据回退周一至周五。"""
+    hw = _holidays.is_workday(d)
+    return d.weekday() <= 4 if hw is None else hw
+
+
+def _next_weekday_fire(cron_expr: str, from_ts: float) -> float:
+    """工作日提醒的下一次触发时刻：逐日找「工作日」。
+
+    cron 的星期位被工作日语义取代——这正是节假日感知的关键：纯 cron `* * 1-5`
+    永远落在周一至五，既躲不开法定假日，也够不着调休补班的周六。"""
+    parts = cron_expr.split()
+    mi, h = int(parts[0]), int(parts[1])
+    base = datetime.fromtimestamp(from_ts, TZ_CN)
+    d = base.date()
+    for _ in range(500):  # 封顶防御：数据齐全时必命中
+        t = base.replace(year=d.year, month=d.month, day=d.day,
+                         hour=h, minute=mi, second=0, microsecond=0)
+        if t > base and _run_day(d):
+            return t.timestamp()
+        d += timedelta(days=1)
+    raise ValueError("工作日提醒 500 天内找不到可触发日（节假日数据异常？）")
+
+
 _HELP = (
     "⏰ 定时提醒（#提醒 帮助 看这里）：\n"
     "#提醒 30分钟后 内容 / #提醒 半小时后 内容\n"
@@ -866,6 +893,7 @@ _HELP = (
     "#提醒 每天 09:00 内容\n"
     "#提醒 每周一三五 10:00 内容 / #提醒 每周一至五 09:00 内容\n"
     "#提醒 周末 10:00 内容 / #提醒 工作日 09:00 内容\n"
+    "#提醒 工作日 09:00 内容（自动跳法定假日、含调休补班；#节假日 查看）\n"
     "#提醒 每月1号 09:00 内容 / #提醒 每月最后一天 内容\n"
     "#提醒 每年11月20日 09:00 内容\n"
     "#提醒 每小时 内容 / #提醒 每30分钟 内容 / #提醒 每隔2小时 内容\n"
@@ -882,6 +910,9 @@ class RemindersPlugin:
         self.disp: Dispatcher = ctx.disp
         self.hub = ctx.hub
         self.store = ReminderStore(ctx.db_path)
+        if self.cfg.holidays_enabled:
+            y = datetime.now(TZ_CN).year
+            _holidays.ensure_years([y, y + 1])
         self._task: asyncio.Task | None = None
 
     # ---------------- 生命周期 ----------------
@@ -926,6 +957,39 @@ class RemindersPlugin:
                 await self._on_missed(r, late)
             else:
                 await self._fire(r, late)
+        # 调休补班日兜底：工作日提醒的 cron（* * 1-5）永远够不着补班的周六/周日，
+        # 这里按节假日表补一次触发；普通工作日由上面的 due 流程负责（last_fired 防重）。
+        if self.cfg.holidays_enabled:
+            await self._fire_weekend_workdays(now)
+
+    async def _fire_weekend_workdays(self, now: float) -> None:
+        d = datetime.fromtimestamp(now, TZ_CN).date()
+        if d.weekday() < 5 or _run_day(d) is not True:
+            return  # 只在周末且确认是补班日时兜底
+        for r in await asyncio.to_thread(self.store.list_items, "active", 1000):
+            if r["rec"] != "weekdays" or not r["cron"]:
+                continue
+            fire_ts = self._today_fire_ts(r["cron"], now)
+            if fire_ts is None or now < fire_ts:
+                continue
+            if float(r["last_fired"] or 0) >= fire_ts:
+                continue  # 今天已经发过
+            late = now - fire_ts
+            if late > self.cfg.grace_seconds:
+                log.info("reminder #%d 补班触发迟了 %ds（超过补发窗口），跳过", r["id"], int(late))
+                continue
+            await self._fire(r, late)
+
+    def _today_fire_ts(self, cron_expr: str, now: float) -> float | None:
+        parts = cron_expr.split()
+        if len(parts) < 5:
+            return None
+        try:
+            mi, h = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        base = datetime.fromtimestamp(now, TZ_CN)
+        return base.replace(hour=h, minute=mi, second=0, microsecond=0).timestamp()
 
     async def _fire(self, r: dict, late: float) -> None:
         rid = r["id"]
@@ -952,7 +1016,10 @@ class RemindersPlugin:
             await asyncio.to_thread(self.store.mark_fired, rid, None, "done")
         else:
             try:
-                nxt = cron_next(r["cron"], float(r["next_at"]))
+                if r["rec"] == "weekdays":
+                    nxt = _next_weekday_fire(r["cron"], float(r["next_at"]))
+                else:
+                    nxt = cron_next(r["cron"], float(r["next_at"]))
             except ValueError as e:  # 理论上建库时已校验，防御历史脏数据
                 await asyncio.to_thread(self.store.mark_missed, rid, str(e))
                 return
@@ -967,7 +1034,8 @@ class RemindersPlugin:
             self._pub({"action": "missed", "id": rid, "title": r["title"], "late_s": int(late)})
             log.warning("reminder #%d missed: %s", rid, reason)
         else:
-            nxt = cron_next(r["cron"], time.time())  # 跳过错过的触发，直接算下一次
+            nxt = (_next_weekday_fire(r["cron"], time.time()) if r["rec"] == "weekdays"
+                   else cron_next(r["cron"], time.time()))  # 跳过错过的触发，直接算下一次
             await asyncio.to_thread(self.store.skip_to_next, rid, nxt, f"跳过错过的触发（迟了 {int(late)}s）")
             self._pub({"action": "missed_skip", "id": rid, "title": r["title"], "late_s": int(late)})
             log.warning("reminder #%d 跳过错过的触发: %s", rid, reason)
@@ -1004,6 +1072,15 @@ class RemindersPlugin:
         if not s.isdigit():
             return "用法：#取消 <id>（#提醒 列表 可查看 id）"
         return await self._cancel(int(s))
+
+    async def cmd_holiday(self, args: str, event: dict) -> str | None:
+        days = _holidays.run_days_ahead(7)
+        lines = [f"{d.strftime('%m-%d')}（{'一二三四五六日'[d.weekday()]}）{st}" for d, st in days]
+        years = _holidays.covered_years()
+        tail = f"数据覆盖 {years[0]}-{years[-1]} 年" if years else \
+            "⚠️ 未找到节假日数据文件（noti_gateway/data/holidays-<年份>.json）"
+        return ("📅 未来 7 天：\n" + "\n".join(lines) + f"\n（{tail}；"
+                "工作日提醒自动跳法定假日、含调休补班）")
 
     async def _create(self, rest: str, event: dict) -> str:
         try:
@@ -1139,3 +1216,4 @@ def setup(ctx: Any) -> None:
                 hint="<时间> <内容>", usage=_HELP)
     ctx.command("列表", handler=plg.cmd_list, desc="查看进行中的提醒")
     ctx.command("取消", handler=plg.cmd_cancel, desc="取消提醒", hint="<id>")
+    ctx.command("节假日", handler=plg.cmd_holiday, desc="查看未来 7 天休/班安排")

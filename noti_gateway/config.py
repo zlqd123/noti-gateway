@@ -209,6 +209,26 @@ class RemindersCfg:
     grace_seconds: int = 900      # 错过补发窗口：停机跨过触发点，重启后窗口内补发
     tick_seconds: float = 1.0     # 调度扫描间隔秒
     max_list: int = 20            # 「提醒 列表」最多展示条数
+    # 工作日提醒的节假日感知（noti_gateway/data/holidays-<年份>.json）
+    holidays_enabled: bool = True
+
+
+@dataclass
+class WatchdogCfg:
+    # 服务器看门狗插件：内存/交换/磁盘/CPU 超阈值告警 + 恢复通知（状态机去抖）
+    enabled: bool = False
+    # 告警通知的 source（走 routes 路由扇出；默认路由时跟随 default_route）
+    source: str = "watchdog"
+    # 各指标告警线（百分比）
+    mem_pct: int = 85
+    swap_pct: int = 70
+    cpu_pct: int = 90
+    disk_pct: int = 90              # 根分区 /
+    disks: dict[str, int] = field(default_factory=dict)  # 额外挂载点: {"/data": 85}
+    check_interval: int = 60        # 采样周期秒（最低 15）
+    confirm: int = 3                # 连续 N 次超标才告警（去抖）
+    recover_confirm: int = 5        # 连续 N 次回落才报恢复
+    proc_top: int = 5               # 内存告警时附 TOP N 进程
 
 
 @dataclass
@@ -239,6 +259,7 @@ class Config:
     uploads: UploadsCfg = field(default_factory=UploadsCfg)
     reminders: RemindersCfg = field(default_factory=RemindersCfg)
     webchat: WebchatCfg = field(default_factory=WebchatCfg)
+    watchdog: WatchdogCfg = field(default_factory=WatchdogCfg)
     default_route: str = "default"
     # 插件清单：noti_gateway/plugins/ 下不以 _ 开头的模块名。
     # 顺序即事件分发顺序：qqws 持有连接，chatdownload 归档在前，命令类插件在后
@@ -370,6 +391,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         uploads=_dd(raw.get("uploads"), UploadsCfg),
         reminders=_dd(raw.get("reminders"), RemindersCfg),
         webchat=_dd(raw.get("webchat"), WebchatCfg),
+        watchdog=_dd(raw.get("watchdog"), WatchdogCfg),
         default_route=raw.get("default_route", "default"),
         plugins=[str(p) for p in (raw.get("plugins") or ["qqws", "chatdownload", "reminders", "agents"])],
         bots=bots,

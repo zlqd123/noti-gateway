@@ -287,7 +287,7 @@ webchat:
 #提醒 每天 09:00 吃药              每日重复
 #提醒 每周一三五 10:00 站会        每周多天（也认 每周一至周五 / 每周六、日）
 #提醒 周末 10:00 大扫除            周六+周日
-#提醒 工作日 09:00 站会            周一至周五
+#提醒 工作日 09:00 站会            周一至周五（自动跳法定假日、含调休补班；#节假日 查看未来 7 天）
 #提醒 每月1号 09:00 交房租         每月重复（也认 每月1、15号 / 每月最后一天）
 #提醒 每年11月20日 09:00 续费      每年重复
 #提醒 每30分钟 喝水                间隔重复（也认 每小时 / 每小时30分 / 每隔2小时 / 每3天 09:00 / 每季度 / 每半年）
@@ -307,6 +307,34 @@ POST   /schedule          {"title": "...", "body": "...", "when": "每天 09:00"
 GET    /schedule?state=active    列表（state: active|done|cancelled|missed|all）
 DELETE /schedule/{id}            取消
 ```
+
+**节假日感知**：`工作日` 提醒按 `noti_gateway/data/holidays-<年份>.json`（holiday-cn 格式）判定——
+法定假日自动跳过、调休补班日（周六/周日）正常触发；数据缺失的年份回退按周一至五。
+`#节假日` 查看未来 7 天的休/班安排。每年官方发布次年安排后，从
+[holiday-cn](https://github.com/NateScarlet/holiday-cn) 下载对应 json 放进 data/ 即可。
+
+## 服务器看门狗（watchdog 插件）
+
+周期采样 psutil（内存/交换/磁盘/CPU），**状态机去抖**后经 Dispatcher 投递告警与恢复通知
+（复用路由/限流/静默——夜间告警可被 agents 静默拦截或按 level 放行）：
+
+- 连续 `confirm` 次超标才告警（默认 3 次），连续 `recover_confirm` 次回落才报恢复（默认 5 次）；
+- 内存告警附带占用 TOP N 进程现场；超阈值 10 个百分点以上升级为 error 级；
+- `/_stats` 的 watchdog 段暴露当前读数与告警状态；`/stream` 可订阅 `&types=watchdog`。
+
+```yaml
+plugins: ["qqws", "chatdownload", "reminders", "agents", "watchdog"]
+watchdog:
+  enabled: true
+  mem_pct: 85            # swap_pct / cpu_pct / disk_pct 同理
+  disks: {"/data": 85}   # 额外挂载点（根分区走 disk_pct）
+  check_interval: 60
+  confirm: 3
+  recover_confirm: 5
+  proc_top: 5
+```
+
+依赖 psutil（requirements.txt 已含）。
 
 投递语义：
 
