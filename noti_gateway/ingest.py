@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import mimetypes
+import re
 from typing import Any
+from urllib.parse import unquote, urlparse
 
+import httpx
 from starlette.requests import Request
 
 from .models import Notification, LEVELS
@@ -22,22 +27,34 @@ MEDIA_KEYS = ("image", "file")
 
 IMAGE_MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
 MAX_INLINE_BYTES = 10 * 1024 * 1024  # QQ 简单上传（/files file_data 内联）实测上限
+MAX_URL_BYTES = 20 * 1024 * 1024     # {"file": {"url": ...}} 网关代下载上限
 
 
 def _norm_media(v: Any, kind: str) -> dict | None:
-    """规范化 image/file 字段：{"b64", mime?, name?} 或 {"ref"}。非法抛 ValueError。"""
+    """规范化 image/file 字段：{"url"} / {"b64", mime?, name?} 或 {"ref"}。非法抛 ValueError。"""
     if v is None:
         return None
     if not isinstance(v, dict):
-        raise ValueError(f"{kind} 必须是对象 {{b64, mime?, name?}} 或 {{ref}}")
+        raise ValueError(f"{kind} 必须是对象 {{url | b64, mime?, name?}} 或 {{ref}}")
     if v.get("ref") is not None:
         ref = str(v.get("ref") or "").strip()
         if not ref:
             raise ValueError(f"{kind}.ref 不能为空")
         return {"ref": ref}
+    url = str(v.get("url") or "").strip()
+    if url:
+        if not re.match(r"^https?://", url, re.I):
+            raise ValueError(f"{kind}.url 必须是 http(s) 地址: {url[:120]}")
+        from .uploads import safe_name
+
+        return {
+            "url": url,
+            "name": safe_name(str(v.get("name") or ""), ""),  # 留空 = 下载阶段从 URL/响应头推断
+            "mime": (str(v.get("mime") or "")).strip().lower(),
+        }
     b64 = v.get("b64")
     if not isinstance(b64, str) or not b64.strip():
-        raise ValueError(f"{kind}.b64 必须是非空 base64 字符串（或改用 ref）")
+        raise ValueError(f"{kind}.b64 必须是非空 base64 字符串（或改用 ref / url）")
     try:
         raw = base64.b64decode(b64, validate=True)
     except Exception:
@@ -221,5 +238,140 @@ async def parse_http(req: Request, source: str, route: str, raw: bytes | None = 
     # raw 复用调用方已读出的原始字节（HMAC 需对原始体签名，避免二次消费 stream）
     if raw is None:
         raw = await _read_body(req)
-    payload = _parse_body(raw, (req.headers.get("content-type") or "").lower())
+    ctype = (req.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in ctype:
+        payload = await parse_multipart(raw, ctype)
+    else:
+        payload = _parse_body(raw, ctype)
     return build_notification(payload, source, route, dict(req.query_params))
+
+
+# ---------------- multipart/form-data（浏览器 / curl -F 友好） ----------------
+
+def _decode_field(raw: bytes, charset: str) -> str:
+    try:
+        return raw.decode(charset)
+    except (UnicodeDecodeError, LookupError):
+        pass
+    try:
+        return raw.decode("gbk")
+    except (UnicodeDecodeError, LookupError):
+        return raw.decode("utf-8", "replace")
+
+
+def parse_multipart_sync(raw: bytes, ctype_header: str) -> dict[str, Any]:
+    """解析 multipart/form-data（标准库 email，二进制安全，零新增依赖）。
+
+    文本字段进 payload（title/body/level/route 等）；带 filename 的字段按字段名
+    归入媒体：``image`` -> image，其余 -> file。返回 payload dict。
+    """
+    from email.parser import BytesParser
+
+    msg = BytesParser().parsebytes(
+        b"Content-Type: " + ctype_header.encode("latin-1")
+        + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw
+    )
+    out: dict[str, Any] = {}
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        name = (part.get_param("name", header="content-disposition") or "").strip().strip('"')
+        filename = part.get_filename() or ""
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            payload = b""
+        if filename:
+            kind = "image" if name == "image" else "file"
+            mime = (part.get_content_type() or "").lower()
+            out[kind] = {"_bytes": payload, "name": filename, "mime": mime}
+        else:
+            charset = part.get_content_charset() or "utf-8"
+            out[name or "body"] = _decode_field(payload, charset)
+    return out
+
+
+async def parse_multipart(raw: bytes, ctype_header: str) -> dict[str, Any]:
+    """parse_multipart_sync 的异步包装：超内联上限的文件字段落盘为 ref。"""
+    from .uploads import get as get_store, safe_name
+
+    out = parse_multipart_sync(raw, ctype_header)
+    for kind in ("file", "image"):
+        media = out.get(kind)
+        if not isinstance(media, dict) or "_bytes" not in media:
+            continue
+        data: bytes = media.pop("_bytes")
+        if not data:
+            raise ValueError(f"{kind} 字段内容为空")
+        if len(data) > MAX_INLINE_BYTES:
+            store = get_store()
+            mime = media.get("mime") or ("image/jpeg" if kind == "image" else "application/octet-stream")
+            meta = await asyncio.to_thread(
+                store.init, safe_name(media.get("name") or "", "file.bin"), mime, kind, len(data)
+            )
+            uid = meta["upload_id"]
+            step = max(1, int(meta.get("chunk_size") or 4 * 1024 * 1024))
+            for i in range((len(data) + step - 1) // step):
+                await asyncio.to_thread(store.put_part, uid, i, data[i * step:(i + 1) * step])
+            ref = await asyncio.to_thread(store.complete, uid)
+            out[kind] = {"ref": ref["ref"]}
+        else:
+            media["b64"] = base64.b64encode(data).decode()
+    return out
+
+
+# ---------------- {"file": {"url": ...}} 网关代下载 ----------------
+
+async def resolve_media_urls(n: Notification, cli: httpx.AsyncClient | None = None) -> Notification:
+    """把 {"url": ...} 形式的 image/file 代下载并落盘为 ref，替换原字段。
+
+    只处理 url 引用（b64/ref 原样跳过）；失败抛 ValueError（调用方转 4xx/错误回执）。
+    """
+    from .uploads import get as get_store, safe_name
+
+    for kind in ("image", "file"):
+        media = getattr(n, kind)
+        if not isinstance(media, dict) or not media.get("url") or media.get("ref") or media.get("b64"):
+            continue
+        url = str(media["url"])
+        own = cli is None
+        client = cli or httpx.AsyncClient(timeout=30, follow_redirects=True)
+        try:
+            try:
+                r = await client.get(url)
+            except Exception as e:
+                raise ValueError(f"{kind}.url 下载失败: {e!r} ({url[:120]})") from None
+            if r.status_code >= 400:
+                raise ValueError(f"{kind}.url 下载失败 http {r.status_code}: {url[:120]}")
+            raw = r.content
+            if not raw:
+                raise ValueError(f"{kind}.url 下载内容为空: {url[:120]}")
+            if len(raw) > MAX_URL_BYTES:
+                raise ValueError(f"{kind}.url 下载 {len(raw)} 字节超过上限 {MAX_URL_BYTES}")
+            ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+            cd = r.headers.get("content-disposition") or ""
+            m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.I) or re.search(r'filename="?([^";]+)"?', cd, re.I)
+            disp_name = unquote(m.group(1)).strip() if m else ""
+            path_name = urlparse(url).path.rsplit("/", 1)[-1]
+            guessed = (mimetypes.guess_type(path_name)[0] or "").lower()
+            name = media.get("name") or disp_name or path_name
+            mime = media.get("mime") or ctype or guessed
+            if kind == "image":
+                mime = mime or "image/jpeg"
+                if mime not in IMAGE_MIME_EXT:
+                    raise ValueError(f"{kind}.url 的 mime 不支持: {mime}（支持 {', '.join(IMAGE_MIME_EXT)}）")
+                name = name or f"image{IMAGE_MIME_EXT[mime]}"
+            else:
+                mime = mime or "application/octet-stream"
+                name = name or "file.bin"
+            store = get_store()
+            meta = await asyncio.to_thread(store.init, safe_name(name, "file.bin"), mime, kind, len(raw))
+            uid = meta["upload_id"]
+            step = max(1, int(meta.get("chunk_size") or 4 * 1024 * 1024))
+            for i in range((len(raw) + step - 1) // step):
+                await asyncio.to_thread(store.put_part, uid, i, raw[i * step:(i + 1) * step])
+            ref = await asyncio.to_thread(store.complete, uid)
+            setattr(n, kind, {"ref": ref["ref"]})
+        finally:
+            if own:
+                await client.aclose()
+    return n

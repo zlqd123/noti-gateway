@@ -22,7 +22,7 @@ from .config import Config, load_config
 from .dailylog import DailyFileHandler
 from .dispatcher import Dispatcher, SubmitError
 from .hub import Hub
-from .ingest import MAX_BODY, build_notification, parse_http
+from .ingest import MAX_BODY, build_notification, parse_http, resolve_media_urls
 from .plugins import PluginCtx, setup_plugins
 from .store import Store
 from .targets import QQTokenCache, build_targets
@@ -134,6 +134,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         except ValueError as e:
             # image/file 字段校验失败等客户端错误
             return JSONResponse({"error": str(e)}, status_code=400)
+        try:
+            n = await resolve_media_urls(n)
+        except ValueError as e:
+            # {"file": {"url": ...}} 代下载失败（网络/超限/mime 不支持）
+            return JSONResponse({"error": str(e)}, status_code=400)
         wait = _truthy(req.query_params.get("wait", "")) or _truthy(req.headers.get("x-wait", ""))
         try:
             result = await disp.submit(n, wait=wait)
@@ -220,6 +225,65 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             return await asyncio.to_thread(upmod.get().complete, upload_id)
 
         return await _u(req, fn, max_body=64 * 1024)
+
+    # ---------------- 裸二进制收件（/f/*）：curl --data-binary / 脚本直传友好 ----------------
+    # POST /f/<route>?name=a.zip&mime=application/zip[&send=1&title=..&body=..&level=..&wait=1]
+    #   默认只落盘，返回 {"ref": ...} 供 /n 的 image/file 以 {"ref": ...} 引用；
+    #   带 send=1 或 title 参数时直接构造成通知提交（image/file = ref）。
+
+    @app.post("/f/{route:path}")
+    async def f_raw(route: str, req: Request) -> JSONResponse:
+        try:
+            raw = await req.body()
+        except Exception:
+            raw = b""
+        if len(raw) > MAX_BODY:
+            return JSONResponse({"error": "payload too large"}, status_code=413)
+        try:
+            source = check_request(req, cfg.auth, raw)
+        except AuthError as e:
+            return JSONResponse({"error": e.message}, status_code=e.status)
+        if not raw:
+            return JSONResponse({"error": "空请求体（裸二进制直接作为 body 发送）"}, status_code=400)
+        qp = req.query_params
+        kind = "image" if str(qp.get("kind") or "").lower() == "image" else "file"
+        name = upmod.safe_name(
+            str(qp.get("name") or ""), "image.bin" if kind == "image" else "file.bin"
+        )
+        mime = (str(qp.get("mime") or "")).lower() or (
+            "image/jpeg" if kind == "image" else "application/octet-stream"
+        )
+        store = upmod.get()
+        try:
+            meta = await asyncio.to_thread(store.init, name, mime, kind, len(raw))
+            uid = meta["upload_id"]
+            step = max(1, int(meta.get("chunk_size") or 4 * 1024 * 1024))
+            for i in range((len(raw) + step - 1) // step):
+                await asyncio.to_thread(store.put_part, uid, i, raw[i * step:(i + 1) * step])
+            ref = await asyncio.to_thread(store.complete, uid)
+        except Exception as e:
+            return JSONResponse({"error": f"落盘失败: {e!r}"[:200]}, status_code=500)
+        if not (_truthy(qp.get("send", "")) or qp.get("title")):
+            return JSONResponse({"ok": True, **ref})
+        payload = {
+            "title": str(qp.get("title") or name),
+            "body": str(qp.get("body") or ""),
+            "level": str(qp.get("level") or "info"),
+            kind: {"ref": ref["ref"]},
+        }
+        n = build_notification(payload, source, route or "default", meta={"via": "raw", "filename": name})
+        wait = _truthy(qp.get("wait", ""))
+        try:
+            result = await disp.submit(n, wait=wait)
+        except SubmitError as e:
+            return JSONResponse(
+                {"error": str(e), "event_id": n.event_id, "level": n.level},
+                status_code=e.status,
+            )
+        return JSONResponse(
+            result,
+            status_code=200 if (wait or result.get("suppressed") or result.get("dropped")) else 202,
+        )
 
     # ---------------- 入站：WebSocket 上行（多客户端并发） ----------------
 
@@ -314,6 +378,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                         if item.pop("_wait", False):
                             want_wait = True
                     n = build_notification(item, source, route, meta={"via": "ws"})
+                    try:
+                        n = await resolve_media_urls(n)
+                    except ValueError as e:
+                        replies.append({"event_id": n.event_id, "error": str(e), "status": 400})
+                        continue
                     try:
                         res = await disp.submit(n, wait=want_wait)
                         replies.append({"event_id": n.event_id, **res})
