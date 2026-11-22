@@ -110,6 +110,12 @@ def build_mock_qq() -> FastAPI:
     @app.post("/v2/users/{uid}/files")
     async def files(uid: str, request: Request):
         body = await request.json()
+        if "file_data" in body:
+            # 直传通道：测试环境模拟 bot 域名恒 400，验证自动降级分片
+            STATE.setdefault("simple", []).append({"file_type": body.get("file_type"),
+                                                   "name": body.get("file_name")})
+            return __import__("fastapi").responses.JSONResponse(
+                {"message": "富媒体文件下载失败", "code": 40093007}, status_code=400)
         STATE["merges"].append(body)
         return {"file_info": f"FIC{len(STATE['merges'])}", "raw_url": "http://fake/raw", "ttl": 86400}
 
@@ -314,6 +320,71 @@ async def main() -> int:
             reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
         check(reply.get("ok") is True or "event_id" in reply, f"WS 回执 (实际 {str(reply)[:120]})")
         check(await wait_until(lambda: len(STATE["preps"]) >= n_preps + 1), "url 经 WS 亦触发代下载上传")
+
+        print("\n[8] markdown + keyboard（msg_type=2 组合，不重复发文本）")
+        async def post_obj(obj: dict, path: str = "/n/recv"):
+            body_bytes = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            return await c.post(f"{base}{path}", content=body_bytes,
+                                headers={**_sign("POST", path, body_bytes),
+                                         "content-type": "application/json"})
+
+        n_msg = len(STATE["messages"])
+        r = await post_obj({"title": "md标题", "markdown": {"content": "**hello md**"},
+                            "keyboard": {"rows": [[{"id": "b1", "render_data": {"label": "按钮"},
+                                                    "action": {"type": 2, "data": "x"}}]]}})
+        check(r.status_code in (200, 202), f"受理 (实际 {r.status_code}: {r.text[:120]})")
+        check(await wait_until(lambda: len(STATE["messages"]) >= n_msg + 1), "恰好一条消息")
+        msg = STATE["messages"][-1]
+        check(msg.get("msg_type") == 2, "msg_type=2")
+        check(msg.get("markdown", {}).get("content") == "**hello md**", "markdown.content 原样")
+        check(msg.get("keyboard", {}).get("content", {}).get("rows", [[]])[0][0].get("id") == "b1",
+              "keyboard rows 自动包 content")
+        check(all(m.get("msg_type") == 2 for m in STATE["messages"][n_msg:]), "未额外发送文本消息")
+
+        print("\n[9] markdown 字符串简写 + 模板 msg_type=3")
+        n_msg = len(STATE["messages"])
+        r = await post_obj({"markdown": "string md"})
+        check(r.status_code in (200, 202), f"受理 (实际 {r.status_code})")
+        check(await wait_until(lambda: len(STATE["messages"]) >= n_msg + 1), "投递完成")
+        check(STATE["messages"][-1].get("markdown", {}).get("content") == "string md", "字符串转 content")
+        n_msg = len(STATE["messages"])
+        r = await post_obj({"markdown": {"template_id": "TID9", "params": [{"key": "k", "values": ["v"]}]}})
+        check(r.status_code in (200, 202), f"受理 (实际 {r.status_code})")
+        check(await wait_until(lambda: len(STATE["messages"]) >= n_msg + 1), "投递完成")
+        check(STATE["messages"][-1].get("msg_type") == 3, "template_id -> msg_type=3")
+
+        print("\n[10] ark 透传（msg_type=4）")
+        n_msg = len(STATE["messages"])
+        r = await post_obj({"ark": {"template_id": 23, "kv": [{"key": "k", "values": ["v"]}]}})
+        check(r.status_code in (200, 202), f"受理 (实际 {r.status_code})")
+        check(await wait_until(lambda: len(STATE["messages"]) >= n_msg + 1), "投递完成")
+        msg = STATE["messages"][-1]
+        check(msg.get("msg_type") == 4 and msg.get("ark", {}).get("template_id") == 23, "ark 原样")
+
+        print("\n[11] raw_qq 透传（被动 msg_id/msg_seq 保留）")
+        n_msg = len(STATE["messages"])
+        r = await post_obj({"raw_qq": {"msg_type": 0, "content": "raw-pass",
+                                       "msg_id": "PASSIVE_ID", "msg_seq": 3}})
+        check(r.status_code in (200, 202), f"受理 (实际 {r.status_code})")
+        check(await wait_until(lambda: len(STATE["messages"]) >= n_msg + 1), "投递完成")
+        msg = STATE["messages"][-1]
+        check(msg.get("content") == "raw-pass" and msg.get("msg_id") == "PASSIVE_ID"
+              and msg.get("msg_seq") == 3, "载荷原样（被动字段不丢）")
+
+        print("\n[12] raw_qq 非法 msg_type -> 400")
+        r = await post_obj({"raw_qq": {"msg_type": 7, "media": {"file_info": "x"}}})
+        check(r.status_code == 400, f"400 (实际 {r.status_code}: {r.text[:120]})")
+
+        print("\n[13] video/audio 富媒体（file_type=2/3）")
+        n_preps = len(STATE["preps"])
+        r = await post_obj({"title": "影音", "video": {"b64": base64.b64encode(b"VID0" * 16).decode(),
+                                                       "mime": "video/mp4", "name": "v.mp4"},
+                            "audio": {"b64": base64.b64encode(b"AUD0" * 16).decode(),
+                                      "mime": "audio/mpeg", "name": "a.mp3"}})
+        check(r.status_code in (200, 202), f"受理 (实际 {r.status_code})")
+        check(await wait_until(lambda: len(STATE["preps"]) >= n_preps + 2), "两个媒体上传完成")
+        types = sorted(pp["file_type"] for pp in STATE["preps"][n_preps:])
+        check(types == [2, 3], f"file_type=2 与 3 (实际 {types})")
 
     for s in servers:
         s.should_exit = True

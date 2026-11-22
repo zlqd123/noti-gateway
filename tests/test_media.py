@@ -9,8 +9,8 @@
   [3] 内联文件（file_type=4）
   [4] /u/* 分片收件 -> ref 引用 -> QQ 分片通道
   [5] 大文件 12MB 多片拼接（三哈希 prepare / PUT / part_finish / merge）
-  [6] 校验与鉴权错误（400/401）+ 简单 /files 表单通道全程不被调用
-      （生产 api.bot.qq.com 简单上传稳定 40093007，已废除，上传恒走分片）
+  [6] 校验与鉴权错误（400/401）+ 小文件直传先试 /files（测试域名恒 400，
+      模拟 api.bot.qq.com 生产行为）自动降级分片通道送达
 """
 
 from __future__ import annotations
@@ -99,6 +99,11 @@ def build_mock_qq() -> FastAPI:
         ctype = request.headers.get("content-type", "")
         if ctype.startswith("application/json"):
             body = json.loads(raw)
+            if "file_data" in body:
+                # 直传通道（生产在 sgroup 域名可用；测试域名恒 400 -> 验证自动降级分片）
+                STATE["simple"].append({"file_type": body.get("file_type"),
+                                        "name": body.get("file_name"), "bytes": len(raw)})
+                return JSONResponse({"message": "富媒体文件下载失败", "code": 40093007}, status_code=400)
             STATE["merges"].append(body)
             return {"file_info": f"FIC{len(STATE['merges'])}", "raw_url": "http://fake/raw",
                     "ttl": 86400, "id": f"m{len(STATE['merges'])}"}
@@ -374,7 +379,9 @@ async def main() -> int:
                           headers={**_sign("POST", p, b""), "content-type": "application/octet-stream"})
         check(rr.status_code in (400, 404), f"非法 upload_id -> 400/404 (实际 {rr.status_code})")
 
-        check(STATE["simple"] == [], "简单 /files 表单通道全程未被调用（生产已废除）")
+        check(len(STATE["simple"]) >= 1, "小文件直传被先试（/files file_data）")
+        check(all(m.get("file_type") in (1, 4) for m in STATE["simple"]),
+              "直传仅用于 image/file（video/audio 恒走分片或超限）")
 
     for s in servers:
         s.should_exit = True

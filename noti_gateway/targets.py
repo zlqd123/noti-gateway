@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from .config import Config, QQCfg, TargetCfg
+from .ingest import MIME_WHITELIST
 from .models import Notification, SendResult, fail, ok
 
 try:  # websockets >= 14 的 asyncio 实现
@@ -89,6 +90,7 @@ def default_text(n: Notification) -> str:
 # --------------------------------------------------------------------------
 # 文档: https://bot.q.qq.com/wiki/develop/api-v2/
 QQ_TOKEN_PATH = "/app/getAppAccessToken"
+SIMPLE_UPLOAD_MAX = 5 * 1024 * 1024  # /files 直传（sgroup 域名）实测上限，超出走分片
 QQ_RETRYABLE_CODES = {100001}  # Too many requests
 
 # 被动回复：带收到消息的 msg_id(+递增 msg_seq) 发送即不占主动消息配额。
@@ -216,20 +218,86 @@ class QQBotTarget:
             return {"msg_type": 2, "markdown": text}
         return {"msg_type": 0, "content": text}
 
-    # ---------------- 富媒体（图片 / 文件） ----------------
-    # 上传恒走分片通道：upload_prepare(三哈希) -> 逐片 PUT -> 逐片 upload_part_finish
+    # ---------------- 全消息类型：raw_qq / ark / markdown(+keyboard) ----------------
+
+    def _special_payload(self, n: Notification) -> dict | None:
+        """全消息类型载荷：raw_qq 透传 > ark（msg_type=4）> markdown(+keyboard)。
+
+        markdown 含 template_id/id 时为 msg_type=3 模板；返回 None 表示走普通文本路径。
+        """
+        if getattr(n, "raw_qq", None):
+            return dict(n.raw_qq)
+        if getattr(n, "ark", None):
+            return {"msg_type": 4, "ark": n.ark, **_passive_params((n.meta or {}).get("passive"))}
+        md = getattr(n, "markdown", None)
+        kb = getattr(n, "keyboard", None)
+        if md or kb:
+            md = md or {}
+            msg_type = 3 if (md.get("template_id") or md.get("id")) else 2
+            payload: dict = {"msg_type": msg_type, "markdown": md}
+            if kb:
+                payload["keyboard"] = kb
+            payload.update(_passive_params((n.meta or {}).get("passive")))
+            return payload
+        return None
+
+    async def _send_special(self, n: Notification) -> SendResult:
+        t0 = time.monotonic()
+        if self.scene == "channel":
+            return fail(self.id, 0, "频道场景不支持 markdown/keyboard/ark/raw_qq（仅文本与富媒体）", retryable=False)
+        payload = self._special_payload(n) or {}
+        for attempt in (1, 2):  # 第二次用于 401 后强制刷新 token 重试
+            try:
+                token = await self.tokens.get(force=attempt == 2)
+            except QQAuthError as e:
+                return fail(self.id, e.code, f"token error: {e.message}", retryable=False)
+            except Exception as e:
+                return fail(self.id, 0, f"token request failed: {e!r}", retryable=True)
+            try:
+                r = await self.tokens.client.post(
+                    self._path(), headers={"Authorization": f"QQBot {token}"},
+                    json=payload, timeout=self.cfg.timeout,
+                )
+            except Exception as e:
+                return fail(self.id, 0, f"special send failed: {e!r}", retryable=True)
+            if r.status_code == 401 and attempt == 1:
+                self.tokens.invalidate()
+                continue
+            if r.status_code == 429 or r.status_code >= 500:
+                return fail(self.id, r.status_code, f"special http {r.status_code}: {r.text[:200]}", retryable=True)
+            if r.status_code >= 400:
+                return fail(self.id, r.status_code, f"special http {r.status_code}: {r.text[:200]}", retryable=False)
+            try:
+                body = r.json()
+            except Exception:
+                return ok(self.id, "non-json response", int((time.monotonic() - t0) * 1000))
+            code = int(body.get("code") or 0) if isinstance(body, dict) else 0
+            if code == 0:
+                return ok(self.id, f"msg_type={payload.get('msg_type')} msg_id={body.get('id', '')}",
+                          int((time.monotonic() - t0) * 1000))
+            return fail(self.id, code, body.get("message") or json.dumps(body, ensure_ascii=False)[:200],
+                        retryable=code in QQ_RETRYABLE_CODES,
+                        elapsed_ms=int((time.monotonic() - t0) * 1000))
+        return fail(self.id, 0, "unreachable")
+
+    # ---------------- 富媒体（图片 / 文件 / 视频 / 音频） ----------------
+    # 双通道上传：≤5MB 先走 /files 直传（api.sgroup.qq.com + file_data base64，
+    #   契约抄自实测可用的 qq-send-file.sh 钩子），失败自动降级分片通道；
+    #   >5MB 恒走分片：upload_prepare(三哈希) -> 逐片 PUT -> 逐片 upload_part_finish
     #   -> files 合并拿 file_info（契约抄自实测可用的 sd_media.py）。
     # 坑位备忘：upload_prepare 必须带全 md5/sha1/md5_10m 三个哈希；
     #   PUT 必须带 Content-Type，否则图能发出去但不渲染；
-    #   /files 简单表单上传在 api.bot.qq.com 稳定 40093007（见 _upload_chunked 注释）。
+    #   /files 简单上传在 api.bot.qq.com 稳定 40093007——直传必须用 sgroup 域名。
+
+    def _media_path(self) -> str:
+        if self.scene == "group":
+            return f"/v2/groups/{self.scene_id}"
+        if self.scene == "c2c":
+            return f"/v2/users/{self.scene_id}"
+        return f"/channels/{self.scene_id}"
 
     def _media_base(self) -> str:
-        base = self.tokens.qq.api_base.rstrip("/")
-        if self.scene == "group":
-            return f"{base}/v2/groups/{self.scene_id}"
-        if self.scene == "c2c":
-            return f"{base}/v2/users/{self.scene_id}"
-        return f"{base}/channels/{self.scene_id}"
+        return self.tokens.qq.api_base.rstrip("/") + self._media_path()
 
     def _resolve_media(self, media: dict | None) -> tuple[bytes, str, str]:
         """内联 b64 或 /u/* ref -> (字节, 文件名, mime)。"""
@@ -276,6 +344,39 @@ class QQBotTarget:
         return None, fail(
             self.id, code, f"upload({how}) failed: {str(body)[:200]}", retryable=code in QQ_RETRYABLE_CODES
         )
+
+    async def _upload_simple(
+        self, token: str, data: bytes, name: str, mime: str, file_type: int
+    ) -> tuple[str | None, SendResult | None]:
+        """小文件直传（/files + file_data base64，≤5MB）。
+
+        契约抄自实测可用的 qq-send-file.sh 钩子：该通道在 api.sgroup.qq.com 可用
+        （api.bot.qq.com 稳定 40093007）。失败一律返回 err，由调用方降级分片通道。
+        """
+        sbase = self.tokens.qq.api_base.rstrip("/")
+        if "api.bot.qq.com" in sbase:
+            sbase = sbase.replace("api.bot.qq.com", "api.sgroup.qq.com")
+        try:
+            r = await self.tokens.client.post(
+                f"{sbase}{self._media_path()}/files",
+                headers={"Authorization": f"QQBot {token}"},
+                json={"file_type": file_type, "file_name": name,
+                      "file_data": base64.b64encode(data).decode(),
+                      "srv_send_msg": False},
+                timeout=max(self.cfg.timeout, 30.0),
+            )
+        except Exception as e:
+            return None, fail(self.id, 0, f"simple upload error: {e!r}", retryable=True)
+        if r.status_code == 401:
+            return None, fail(self.id, 401, "token expired", retryable=True)
+        try:
+            body = r.json()
+        except Exception:
+            return None, fail(self.id, r.status_code, f"simple non-json: {r.text[:200]}", retryable=True)
+        code = int(body.get("code") or 0) if isinstance(body, dict) else -1
+        if code == 0 and isinstance(body, dict) and body.get("file_info"):
+            return str(body["file_info"]), None
+        return None, fail(self.id, code, f"simple upload failed: {str(body)[:200]}", retryable=True)
 
     async def _upload_chunked(
         self, token: str, data: bytes, name: str, mime: str, file_type: int
@@ -394,9 +495,10 @@ class QQBotTarget:
             return done(fail(self.id, 0, f"{kind} 解析失败: {e}", retryable=False))
         if self.scene == "channel":
             return done(fail(self.id, 0, "频道场景暂不支持富媒体", retryable=False))
-        if kind == "image" and mime not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
-            return done(fail(self.id, 0, f"不支持的图片类型: {mime}", retryable=False))
-        file_type = 1 if kind == "image" else 4
+        wl = MIME_WHITELIST.get(kind)
+        if wl and mime not in wl:
+            return done(fail(self.id, 0, f"不支持的{kind}类型: {mime}（支持 {', '.join(sorted(wl))}）", retryable=False))
+        file_type = {"image": 1, "video": 2, "audio": 3}.get(kind, 4)
 
         for attempt in (1, 2):  # 第二次用于 401 后强制刷新 token 重试
             try:
@@ -406,7 +508,15 @@ class QQBotTarget:
             except Exception as e:  # 网络异常
                 return done(fail(self.id, 0, f"token request failed: {e!r}", retryable=True))
 
-            file_info, err = await self._upload_chunked(token, data, name, mime, file_type)
+            file_info, err = (None, None)
+            if len(data) <= SIMPLE_UPLOAD_MAX:
+                # 小文件先走 /files 直传（sgroup 域名），失败自动降级分片通道
+                file_info, err = await self._upload_simple(token, data, name, mime, file_type)
+                if err is not None and err.code == 401 and attempt == 1:
+                    self.tokens.invalidate()
+                    continue
+            if err is not None or not file_info:
+                file_info, err = await self._upload_chunked(token, data, name, mime, file_type)
             if err is not None:
                 if err.code == 401 and attempt == 1:
                     self.tokens.invalidate()
@@ -535,16 +645,17 @@ class QQBotTarget:
         return done(fail(self.id, 0, "unreachable"))
 
     async def send(self, n: Notification) -> SendResult:
-        """文本 + 富媒体组合发送：image/file 各自一条 msg_type 7，文本按需一条。
-
-        纯媒体（无标题/正文/字段）不发多余文本消息。
+        """全消息类型组合发送：四类媒体各自一条 msg_type 7；markdown/keyboard/ark/raw_qq
+        走专用载荷一条；纯文本按需一条。纯媒体（无标题/正文/字段）不发多余文本消息。
         """
         results: list[tuple[str, SendResult]] = []
-        if n.image:
-            results.append(("image", await self._send_media(n, n.image, "image")))
-        if n.file:
-            results.append(("file", await self._send_media(n, n.file, "file")))
-        if (n.title or n.body or n.fields) or not results:
+        for kind, media in (("image", n.image), ("file", n.file), ("video", n.video), ("audio", n.audio)):
+            if media:
+                results.append((kind, await self._send_media(n, media, kind)))
+        special = self._special_payload(n)
+        if special:
+            results.append(("msg", await self._send_special(n)))
+        elif (n.title or n.body or n.fields) or not results:
             results.append(("text", await self._send_text(n)))
         if len(results) == 1:
             return results[0][1]

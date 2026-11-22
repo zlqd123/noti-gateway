@@ -23,15 +23,23 @@ BODY_KEYS = ("body", "content", "message", "desc", "description", "detail", "det
 LEVEL_KEYS = ("level", "severity", "status", "priority", "loglevel")
 ROUTE_KEYS = ("route", "channel", "topic")
 SOURCE_KEYS = ("source", "service", "app", "from", "sender")
-MEDIA_KEYS = ("image", "file")
+MEDIA_KEYS = ("image", "file", "video", "audio")
+MSG_KEYS = ("markdown", "keyboard", "ark", "raw_qq")
 
 IMAGE_MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
+VIDEO_MIMES = {"video/mp4", "video/quicktime"}
+AUDIO_MIMES = {"audio/mpeg", "audio/mp3", "audio/aac", "audio/wav", "audio/x-wav", "audio/silk"}
+MEDIA_KINDS = ("image", "file", "video", "audio")
+_DEFAULT_MIME = {"image": "image/jpeg", "file": "application/octet-stream",
+                 "video": "video/mp4", "audio": "audio/mpeg"}
+_DEFAULT_NAME = {"image": "image.jpg", "file": "file.bin", "video": "video.mp4", "audio": "audio.mp3"}
+MIME_WHITELIST = {"image": set(IMAGE_MIME_EXT), "file": None, "video": VIDEO_MIMES, "audio": AUDIO_MIMES}
 MAX_INLINE_BYTES = 10 * 1024 * 1024  # QQ 简单上传（/files file_data 内联）实测上限
 MAX_URL_BYTES = 20 * 1024 * 1024     # {"file": {"url": ...}} 网关代下载上限
 
 
 def _norm_media(v: Any, kind: str) -> dict | None:
-    """规范化 image/file 字段：{"url"} / {"b64", mime?, name?} 或 {"ref"}。非法抛 ValueError。"""
+    """规范化 image/file/video/audio 字段：{"url"} / {"b64", mime?, name?} 或 {"ref"}。非法抛 ValueError。"""
     if v is None:
         return None
     if not isinstance(v, dict):
@@ -66,18 +74,71 @@ def _norm_media(v: Any, kind: str) -> dict | None:
             f"{kind} 解码后 {len(raw)} 字节超过内联上限 {MAX_INLINE_BYTES}，请走 /u/* 分片上传再用 ref 引用"
         )
     mime = (str(v.get("mime") or "")).strip().lower()
-    if kind == "image":
-        mime = mime or "image/jpeg"
-        if mime not in IMAGE_MIME_EXT:
-            raise ValueError(f"image.mime 不支持: {mime}（支持 {', '.join(IMAGE_MIME_EXT)}）")
-        default_name = f"image{IMAGE_MIME_EXT[mime]}"
-    else:
-        mime = mime or "application/octet-stream"
-        default_name = "file.bin"
+    mime = mime or _DEFAULT_MIME.get(kind, "application/octet-stream")
+    whitelist = MIME_WHITELIST.get(kind)
+    if whitelist and mime not in whitelist:
+        raise ValueError(f"{kind}.mime 不支持: {mime}（支持 {', '.join(sorted(whitelist))}）")
     from .uploads import safe_name
 
-    name = safe_name(str(v.get("name") or ""), default_name)
+    name = safe_name(str(v.get("name") or ""), _DEFAULT_NAME.get(kind, "file.bin"))
     return {"b64": b64, "mime": mime, "name": name}
+
+
+def _json_or_dict(v: Any, name: str) -> dict:
+    """keyboard/ark/raw_qq 允许整包 JSON 字符串（multipart 表单字段场景）。"""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except json.JSONDecodeError:
+            raise ValueError(f"{name} 是 JSON 字符串但无法解析") from None
+    if not isinstance(v, dict):
+        raise ValueError(f"{name} 必须是对象（或可解析的 JSON 对象字符串）")
+    return v
+
+
+def _norm_markdown(v: Any) -> dict:
+    """markdown：字符串 → {"content": ...}；含 template_id/id 的对象 = msg_type=3 模板。"""
+    if isinstance(v, str):
+        v = {"content": v}
+    if not isinstance(v, dict):
+        raise ValueError("markdown 必须是字符串或对象")
+    if v.get("template_id") or v.get("id"):  # 模板 markdown（msg_type=3），QQ 侧结构原样透传
+        return v
+    if not isinstance(v.get("content"), str) or not v["content"].strip():
+        raise ValueError("markdown.content 必须是非空字符串")
+    return v
+
+
+def _norm_keyboard(v: Any) -> dict:
+    """keyboard：{"rows": [...]} 自动包成 {"content": {"rows": ...}}；QQ 结构原样透传。"""
+    v = _json_or_dict(v, "keyboard")
+    if "rows" in v and "content" not in v:
+        if not isinstance(v["rows"], list):
+            raise ValueError("keyboard.rows 必须是数组")
+        return {"content": {"rows": v["rows"]}}
+    return v
+
+
+def _norm_ark(v: Any) -> dict:
+    v = _json_or_dict(v, "ark")
+    if not (v.get("template_id") or v.get("kv")):
+        raise ValueError("ark 需为 QQ ark 结构（template_id / kv）")
+    return v
+
+
+def _norm_raw_qq(v: Any) -> dict:
+    """raw_qq：完整 QQ 消息载荷透传（msg_id/msg_seq 等被动字段调用方自带）。"""
+    v = _json_or_dict(v, "raw_qq")
+    mt = v.get("msg_type")
+    if mt not in (0, 2, 3, 4):
+        raise ValueError("raw_qq.msg_type 仅支持 0/2/3/4（富媒体请用 image/file/video/audio 字段）")
+    if mt == 0 and not str(v.get("content") or "").strip():
+        raise ValueError("raw_qq msg_type=0 缺 content")
+    if mt in (2, 3) and not isinstance(v.get("markdown"), dict):
+        raise ValueError("raw_qq msg_type=2/3 缺 markdown 对象")
+    if mt == 4 and not isinstance(v.get("ark"), dict):
+        raise ValueError("raw_qq msg_type=4 缺 ark 对象")
+    return v
 
 
 def _pick(d: dict, keys: tuple[str, ...], default: str = "") -> str:
@@ -177,14 +238,14 @@ def build_notification(
     elif isinstance(payload, dict):
         d = _unwrap(payload)
         # raw 只做排障用：剔除媒体大字段，避免 base64 在队列里存两份
-        meta.setdefault("raw", {k: v for k, v in payload.items() if k not in MEDIA_KEYS})
+        meta.setdefault("raw", {k: v for k, v in payload.items() if k not in MEDIA_KEYS + MSG_KEYS})
         title = _pick(d, TITLE_KEYS)
         body = _pick(d, BODY_KEYS)
         if title == body:
             body = ""
         consumed = (
             set(TITLE_KEYS) | set(BODY_KEYS) | set(LEVEL_KEYS)
-            | set(ROUTE_KEYS) | set(SOURCE_KEYS) | set(MEDIA_KEYS)
+            | set(ROUTE_KEYS) | set(SOURCE_KEYS) | set(MEDIA_KEYS) | set(MSG_KEYS)
         )
         fields = {k: v for k, v in d.items() if k not in consumed and not isinstance(v, (dict, list))}
         for k, v in d.items():
@@ -198,6 +259,12 @@ def build_notification(
             "fields": fields,
             "image": _norm_media(d.get("image"), "image"),
             "file": _norm_media(d.get("file"), "file"),
+            "video": _norm_media(d.get("video"), "video"),
+            "audio": _norm_media(d.get("audio"), "audio"),
+            "markdown": _norm_markdown(d["markdown"]) if d.get("markdown") is not None else None,
+            "keyboard": _norm_keyboard(d["keyboard"]) if d.get("keyboard") is not None else None,
+            "ark": _norm_ark(d["ark"]) if d.get("ark") is not None else None,
+            "raw_qq": _norm_raw_qq(d["raw_qq"]) if d.get("raw_qq") is not None else None,
         }
     else:
         data = {"title": str(payload), "body": "", "fields": {}, "image": None, "file": None}
@@ -229,6 +296,12 @@ def build_notification(
         fields=data.get("fields") or {},
         image=data.get("image"),
         file=data.get("file"),
+        video=data.get("video"),
+        audio=data.get("audio"),
+        markdown=data.get("markdown"),
+        keyboard=data.get("keyboard"),
+        ark=data.get("ark"),
+        raw_qq=data.get("raw_qq"),
         route=data.get("route") or route,
         meta=meta,
     )
@@ -295,7 +368,7 @@ async def parse_multipart(raw: bytes, ctype_header: str) -> dict[str, Any]:
     from .uploads import get as get_store, safe_name
 
     out = parse_multipart_sync(raw, ctype_header)
-    for kind in ("file", "image"):
+    for kind in MEDIA_KINDS:
         media = out.get(kind)
         if not isinstance(media, dict) or "_bytes" not in media:
             continue
@@ -304,9 +377,9 @@ async def parse_multipart(raw: bytes, ctype_header: str) -> dict[str, Any]:
             raise ValueError(f"{kind} 字段内容为空")
         if len(data) > MAX_INLINE_BYTES:
             store = get_store()
-            mime = media.get("mime") or ("image/jpeg" if kind == "image" else "application/octet-stream")
+            mime = media.get("mime") or _DEFAULT_MIME[kind]
             meta = await asyncio.to_thread(
-                store.init, safe_name(media.get("name") or "", "file.bin"), mime, kind, len(data)
+                store.init, safe_name(media.get("name") or "", _DEFAULT_NAME[kind]), mime, kind, len(data)
             )
             uid = meta["upload_id"]
             step = max(1, int(meta.get("chunk_size") or 4 * 1024 * 1024))
@@ -328,7 +401,7 @@ async def resolve_media_urls(n: Notification, cli: httpx.AsyncClient | None = No
     """
     from .uploads import get as get_store, safe_name
 
-    for kind in ("image", "file"):
+    for kind in MEDIA_KINDS:
         media = getattr(n, kind)
         if not isinstance(media, dict) or not media.get("url") or media.get("ref") or media.get("b64"):
             continue
@@ -355,16 +428,13 @@ async def resolve_media_urls(n: Notification, cli: httpx.AsyncClient | None = No
             guessed = (mimetypes.guess_type(path_name)[0] or "").lower()
             name = media.get("name") or disp_name or path_name
             mime = media.get("mime") or ctype or guessed
-            if kind == "image":
-                mime = mime or "image/jpeg"
-                if mime not in IMAGE_MIME_EXT:
-                    raise ValueError(f"{kind}.url 的 mime 不支持: {mime}（支持 {', '.join(IMAGE_MIME_EXT)}）")
-                name = name or f"image{IMAGE_MIME_EXT[mime]}"
-            else:
-                mime = mime or "application/octet-stream"
-                name = name or "file.bin"
+            mime = mime or _DEFAULT_MIME[kind]
+            whitelist = MIME_WHITELIST.get(kind)
+            if whitelist and mime not in whitelist:
+                raise ValueError(f"{kind}.url 的 mime 不支持: {mime}（支持 {', '.join(sorted(whitelist))}）")
+            name = name or _DEFAULT_NAME[kind]
             store = get_store()
-            meta = await asyncio.to_thread(store.init, safe_name(name, "file.bin"), mime, kind, len(raw))
+            meta = await asyncio.to_thread(store.init, safe_name(name, _DEFAULT_NAME[kind]), mime, kind, len(raw))
             uid = meta["upload_id"]
             step = max(1, int(meta.get("chunk_size") or 4 * 1024 * 1024))
             for i in range((len(raw) + step - 1) // step):
