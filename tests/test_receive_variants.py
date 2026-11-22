@@ -320,6 +320,8 @@ async def main() -> int:
             reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
         check(reply.get("ok") is True or "event_id" in reply, f"WS 回执 (实际 {str(reply)[:120]})")
         check(await wait_until(lambda: len(STATE["preps"]) >= n_preps + 1), "url 经 WS 亦触发代下载上传")
+        n_msg7 = len(STATE["messages"])
+        check(await wait_until(lambda: len(STATE["messages"]) >= n_msg7 + 2, timeout=25.0), "WS 消息（文本+媒体）全部投递")
 
         print("\n[8] markdown + keyboard（msg_type=2 组合，不重复发文本）")
         async def post_obj(obj: dict, path: str = "/n/recv"):

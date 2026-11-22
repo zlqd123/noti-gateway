@@ -8,8 +8,10 @@
 连接归属：qqws.bot > chatdownload.bot > 第一个带凭据的 bot > 旧式全局 qq 段。
 access_token 与发送侧共用同一份 QQTokenCache（Registry.token_caches）。
 
-当前订阅 intents：C2C_MESSAGE_CREATE（单聊）。未来扩展群聊/按钮事件时
-在此处加 intents 并广播新事件类型，下游插件各自按类型取用。
+当前订阅 intents：单聊/群聊消息（1<<25）+ 互动回调（1<<26）。所有 dispatch
+事件（除 READY/RESUMED）广播到 ctx.event_listeners 与 hub（SSE types=qq_event）：
+`{"event": <t>, "bot": <bot_id>, "data": <原始事件>}`。INTERACTION_CREATE 收到后
+自动回应（PUT /interactions/{id} code=0），QQ 客户端不转圈，调用方无需再 ack。
 
 观测：/_health 的 ``qqws`` 段、/_stats 的 ``qqws`` 段（state/session/received/uptime）。
 """
@@ -36,8 +38,9 @@ except ImportError:  # pragma: no cover - 老版本兜底
 
 log = logging.getLogger("noti.qqws")
 
-# GROUP_AND_C2C_EVENT：单聊(C2C_MESSAGE_CREATE) + 群聊消息事件
-QQ_INTENTS_C2C = 1 << 25
+# GROUP_AND_C2C_EVENT(1<<25)：单聊(C2C_MESSAGE_CREATE) + 群聊消息事件
+# INTERACTION(1<<26)：按钮回调（INTERACTION_CREATE），收到后自动回应并广播
+QQ_INTENTS = (1 << 25) | (1 << 26)
 
 
 META = PluginMeta(name="qqws", desc="QQ 官方网关长连接（唯一收消息入口，广播事件流）", version="1.1.0")
@@ -45,6 +48,26 @@ META = PluginMeta(name="qqws", desc="QQ 官方网关长连接（唯一收消息�
 
 class _Reconnect(Exception):
     """服务端要求重连（op7）或会话失效（op9）。"""
+
+
+_BROADCAST_EVENTS = {"C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "INTERACTION_CREATE"}
+
+
+def _find_key(obj: Any, key: str) -> Any:
+    """递归查找 JSON 字段（交互事件 payload 结构随场景变化，防御性解析）。"""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    return None
 
 
 class QQGateway:
@@ -58,6 +81,7 @@ class QQGateway:
         self.tokens = tokens
         self.client = client  # 复用网关共享 client（取 /gateway 地址用）
         self.ctx = ctx        # PluginCtx：事件广播
+        self.hub = getattr(ctx, "hub", None)  # SSE /stream 广播（types=qq_event）
 
         self._task: asyncio.Task | None = None
         self._closing = False
@@ -136,7 +160,7 @@ class QQGateway:
             "op": 2,
             "d": {
                 "token": f"QQBot {token}",
-                "intents": QQ_INTENTS_C2C,
+                "intents": QQ_INTENTS,
                 "shard": [0, 1],
                 "properties": {},
             },
@@ -218,12 +242,32 @@ class QQGateway:
         elif t == "RESUMED":
             self._attempt = 0
             log.info("qqws RESUMED")
-        elif t == "C2C_MESSAGE_CREATE":
+        elif t in _BROADCAST_EVENTS:
             self.received += 1
-            # 登记 msg_id：被动回复窗口判断用（回复带 msg_id 不占主动消息配额）
-            self.ctx.remember_msg(d.get("id"),
-                                  str((d.get("author") or {}).get("user_openid") or ""))
+            if t == "C2C_MESSAGE_CREATE":
+                # 登记 msg_id：被动回复窗口判断用（回复带 msg_id 不占主动消息配额）
+                self.ctx.remember_msg(d.get("id"),
+                                      str((d.get("author") or {}).get("user_openid") or ""))
+            if t == "INTERACTION_CREATE":
+                asyncio.create_task(self._ack_interaction(d))
             await self.ctx.dispatch_event(t, d)
+            if self.hub is not None:
+                self.hub.publish("qq_event", {"event": t, "bot": self.bot_id, "data": d})
+
+    async def _ack_interaction(self, d: dict) -> None:
+        """回应按钮交互（PUT /interactions/{id} code=0），避免 QQ 客户端转圈。"""
+        iid = d.get("id") or _find_key(d, "interaction_id")
+        if not iid:
+            return
+        try:
+            token = await self.tokens.get()
+            await self.client.put(
+                self.qq.api_base.rstrip("/") + f"/interactions/{iid}",
+                headers={"Authorization": f"QQBot {token}"},
+                json={"code": 0}, timeout=10,
+            )
+        except Exception as e:
+            log.warning("回应交互 %s 失败: %r", str(iid)[:24], e)
 
 
 def setup(ctx: Any) -> None:
