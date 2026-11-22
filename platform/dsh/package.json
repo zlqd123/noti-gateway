@@ -1,6 +1,6 @@
 {
   "name": "dsh-notifier-gate",
-  "version": "0.13.1-qq.19",
+  "version": "0.13.1-qq.20",
   "description": "DSH QQ 官方机器人通知插件（dsh-notifier 的 QQ 专项裁剪版）：仅保留 qq-bot 出站渠道（已网关化）（一律经 noti-gateway 投递）与 QQ 入站（v0.14 经统一网关 SSE，零直连），配置完全自持。",
   "type": "module",
   "main": "src/plugin-entry.mjs",

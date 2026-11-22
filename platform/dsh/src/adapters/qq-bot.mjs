@@ -3,8 +3,16 @@
 // 汇入统一配额池（落盘+重试+死信+多工具共享）。
 // 直连 QQ 官方 API（换 access_token → /v2/.../messages）的整条路径已移除：
 // 不再有"网关失败静默回退直连"的第二条链路——网关失败即本条失败，行为可预期。
-// 入站（WS 网关 + 编号回复）仍由 inbound/qq-gw.mjs 负责，与出站无关。
+// 入站（统一网关 SSE + raw_qq 发送）由 inbound/qq-gw.mjs 负责，与出站无关。
+//
+// v0.14 文件收发多形态（对齐网关接入文档 §2.6）：
+//  - 富媒体四类透传：msg.image / msg.file / msg.video / msg.audio，字段支持
+//    {b64, mime?, name?} 内联、{ref} 引用 /u/* 分片上传件、{url} 网关代下载（≤20MB）；
+//  - 大文件自动分片：b64 解码后 > INLINE_B64_MAX_BYTES（9MB，b64 膨胀 4/3 后 ≈12MB，
+//    贴网关 16MB 请求体上限留余量）时，先走 /u/init → 分片 POST → /u/complete 拿 ref，
+//    再以引用发送——调用方无感，无需自己关心网关请求体上限。
 
+import { Buffer } from 'node:buffer'
 import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { postJson, str, num, NotifyError, ERROR_CODES } from './_shared.mjs'
 
@@ -53,9 +61,12 @@ export function resolve(cfg = {}) {
 /** HMAC v1 签名核心（确定性，便于跨语言对拍）：
  *  canonical = METHOD\nPATH\nTS\nNONCE\nBODY_SHA256_HEX
  *  X-Noti-Signature: v1=<HMAC_SHA256(secret, canonical) 的 hex>
- *  PATH 用请求路径（不含查询串），与网关侧 req.url.path 对齐。 */
+ *  PATH 用请求路径（不含查询串），与网关侧 req.url.path 对齐。
+ *  body 可为字符串（utf8 语义）或 Buffer/Uint8Array（二进制语义——/u/* 分片原文）。 */
 export function signHeaders(secret, keyId, { method, path, body, ts, nonce }) {
-  const bodyHex = createHash('sha256').update(body, 'utf8').digest('hex')
+  const bodyHex = typeof body === 'string'
+    ? createHash('sha256').update(body, 'utf8').digest('hex')
+    : createHash('sha256').update(body).digest('hex')
   const canonical = [method.toUpperCase(), path, String(ts), String(nonce), bodyHex].join('\n')
   const sig = 'v1=' + createHmac('sha256', secret).update(canonical, 'utf8').digest('hex')
   const h = {
@@ -78,14 +89,75 @@ function signHmac(resolved) {
   }
 }
 
+// ---------- v0.14 文件多形态：大文件 /u/* 分片上传 ----------
+
+/** 内联 b64 的解码字节上限：b64 膨胀 4/3 后 ≈12MB，贴网关 16MB 请求体上限留余量。
+ *  超过即自动转 /u/* 分片上传（调用方无感）。 */
+export const INLINE_B64_MAX_BYTES = 9 * 1024 * 1024
+
+/** 网关 HMAC 直发（原生 fetch，支持二进制 body）——/u/* 分片与 JSON 端点共用。 */
+async function gwFetch(resolved, method, path, body, { query = '', timeoutMs } = {}) {
+  const ts = String(Math.floor(Date.now() / 1000))
+  const nonce = randomBytes(16).toString('hex')
+  const headers = {
+    ...signHeaders(resolved.gatewaySecret, resolved.gatewayKeyId, { method, path, body, ts, nonce }),
+    host: new URL(resolved.gatewayUrl).host,
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs ?? resolved.timeoutMs)
+  try {
+    return await fetch(`${resolved.gatewayUrl}${path}${query}`, {
+      method,
+      headers,
+      body: method === 'GET' ? undefined : body,
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** /u/init → 分片 POST → /u/complete，返回 {"ref","name","size"}（网关落盘件）。
+ *  分片大小以 /u/init 返回的 chunk_size 为准（缺省 4MB）；单分片超 chunk_size+4096 被网关拒收。 */
+export async function uploadFileChunked(resolved, { b64, mime, name, kind }) {
+  const raw = Buffer.from(String(b64), 'base64')
+  const initBody = JSON.stringify({
+    name: str(name) || 'file.bin',
+    mime: str(mime) || 'application/octet-stream',
+    kind: str(kind) || 'file',
+    size: raw.length,
+  })
+  const initRes = await gwFetch(resolved, 'POST', '/u/init', initBody)
+  const init = await initRes.json().catch(() => null)
+  if (!initRes.ok || typeof init?.upload_id !== 'string' || init.upload_id === '') {
+    throw new NotifyError(`/u/init 失败（HTTP ${initRes.status}）: ${JSON.stringify(init)?.slice(0, 200)}`, ERROR_CODES.NETWORK_ERROR)
+  }
+  const chunkSize = Math.max(1, Number(init.chunk_size) || 4 * 1024 * 1024)
+  const total = Math.ceil(raw.length / chunkSize)
+  for (let i = 0; i < total; i += 1) {
+    const part = raw.subarray(i * chunkSize, (i + 1) * chunkSize)
+    const partRes = await gwFetch(resolved, 'POST', `/u/${encodeURIComponent(init.upload_id)}/part/${i}`, part)
+    if (!partRes.ok) {
+      throw new NotifyError(`/u 分片 ${i}/${total} 上传失败（HTTP ${partRes.status}）`, ERROR_CODES.NETWORK_ERROR)
+    }
+  }
+  const compRes = await gwFetch(resolved, 'POST', `/u/${encodeURIComponent(init.upload_id)}/complete`, '{}')
+  const comp = await compRes.json().catch(() => null)
+  if (!compRes.ok || typeof comp?.ref !== 'string' || comp.ref === '') {
+    throw new NotifyError(`/u/complete 失败（HTTP ${compRes.status}）: ${JSON.stringify(comp)?.slice(0, 200)}`, ERROR_CODES.NETWORK_ERROR)
+  }
+  return comp
+}
+
 /** 经统一网关（noti-gateway）投递纯推送：汇入统一配额池（落盘+重试+死信）。
- *  msg 可带 image/file 富媒体（{b64,mime?,name?} 内联 或 {ref} 引用 /u/* 分片上传件），
- *  原样透传给网关的 image/file 字段；纯媒体消息不硬造标题。 */
+ *  msg 可带 image/file/video/audio 富媒体（{b64,mime?,name?} 内联 / {ref} 引用 /
+ *  {url} 网关代下载），原样透传给网关对应字段；纯媒体消息不硬造标题。 */
 async function sendViaGateway(resolved, msg) {
   const media = {}
-  if (msg.image) media.image = msg.image
-  if (msg.file) media.file = msg.file
-  const hasMedia = Boolean(media.image || media.file)
+  for (const kind of ['image', 'file', 'video', 'audio']) {
+    if (msg[kind]) media[kind] = msg[kind]
+  }
+  const hasMedia = Object.keys(media).length > 0
   const text = msg.title.length > 0 ? `${msg.title}\n${msg.content}` : msg.content
   const lines = text.split('\n')
   const title = (lines[0] ?? '').trim().slice(0, 100) || (hasMedia ? '' : '(无标题)')
@@ -113,7 +185,17 @@ async function sendViaGateway(resolved, msg) {
 
 /** 发送主动消息——**一律经统一网关**（noti-gateway）：汇入统一配额池（落盘+重试+死信）。
  *  直连 QQ 官方 API 的路径已整体移除：网关失败即本条失败（不再静默回退直连，
- *  避免"看起来发出去了、其实是另一条链路"的不可预期）。 */
+ *  避免"看起来发出去了、其实是另一条链路"的不可预期）。
+ *  v0.14：任一富媒体字段带超大 b64（解码 > INLINE_B64_MAX_BYTES）时，自动先走
+ *  /u/* 分片上传换 ref 再发送——网关请求体上限对调用方透明。 */
 export async function send(resolved, msg) {
-  await sendViaGateway(resolved, msg)
+  let out = msg
+  for (const kind of ['image', 'file', 'video', 'audio']) {
+    const m = out[kind]
+    if (m && typeof m.b64 === 'string' && Buffer.from(m.b64, 'base64').length > INLINE_B64_MAX_BYTES) {
+      const uploaded = await uploadFileChunked(resolved, { ...m, kind })
+      out = { ...out, [kind]: { ref: uploaded.ref, mime: m.mime, name: m.name } }
+    }
+  }
+  await sendViaGateway(resolved, out)
 }

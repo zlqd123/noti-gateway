@@ -1,3 +1,13 @@
+## 0.13.1-qq.20（2026-11-22）
+
+### 出站文件收发多形态（对齐网关 §2.6）
+
+- 富媒体透传扩到四类：`msg.image / msg.file / msg.video / msg.audio`，
+  字段支持 `{b64, mime?, name?}` 内联、`{ref}` 引用 /u/* 分片上传件、`{url}` 网关代下载（≤20MB）；
+- 大文件自动分片：b64 解码 > 9MB（内联 b64 ≈12MB，贴网关 16MB 请求体上限留余量）时，
+  先 `/u/init → 分片 POST（二进制 HMAC 签名）→ /u/complete` 拿 ref 再引用发送，调用方无感；
+- 真实验证：小文件内联实发送达 QQ（dsh-inline-test.txt）；10MB /u/* 分片上传拿到 ref。
+
 ## 0.13.1-qq.19（2026-11-22）
 
 ### 入站零直连：统一网关模式（transport='gateway'）
