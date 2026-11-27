@@ -25,6 +25,7 @@ let botOnline = null;
 let pendingFile = null;      // 待发送附件
 let pendingFileUrl = null;
 let memberMap = {};          // openid -> 昵称（当前会话已见过的成员）
+let profiles = {};           // openid -> {username, avatar, allow_proactive_msg}（官方资料，会话级）
 let sending = false;         // 发送请求进行中（防连点）
 
 /* -------------------------------------------------------------- 工具 */
@@ -50,10 +51,15 @@ function avatarColor(str) {
   return `hsl(${h % 360}, 55%, 45%)`;
 }
 function shortId(s) { return String(s || "").slice(0, 10); }
+function avatarSrc(rel) {
+  if (!rel) return "";
+  return rel + (rel.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token);
+}
 function displayName(chat, type, name) {
-  // 用户手动改的别名优先，其次官方群名，最后 openid 短格式
+  // 用户手动改的别名优先，其次官方群名/资料用户名，最后 openid 短格式
   const base = aliases[chat] || name;
   if (base) return base;
+  if (type === "friend" && profiles[chat.slice(7)]?.username) return profiles[chat.slice(7)].username;
   return type === "group" ? `群聊 ${shortId(chat.slice(6))}` :
     type === "friend" ? `好友 ${shortId(chat.slice(7))}` :
     type === "dms" ? `私信 ${shortId(chat.slice(4))}` :
@@ -183,8 +189,12 @@ function renderChatList() {
     const name = displayName(c.chat, c.type, c.name);
     const preview = (c.last_dir === "out" ? "【bot】" : "") + (c.last_text || "");
     const n = unread[c.chat] || 0;
+    const av = (c.avatar || (c.type === "friend" && profiles[c.chat.slice(7)]?.avatar) || "");
+    const avHtml = av
+      ? `<img class="avatar-img" src="${escapeHtml(avatarSrc(av))}" alt="" onerror="this.remove()">`
+      : escapeHtml(name.slice(0, 1));
     div.innerHTML = `
-      <div class="chat-avatar" style="background:${avatarColor(c.chat)}">${escapeHtml(name.slice(0, 1))}</div>
+      <div class="chat-avatar" style="background:${avatarColor(c.chat)}">${avHtml}</div>
       <div class="chat-meta">
         <div class="chat-name">${escapeHtml(name)}</div>
         <div class="chat-preview">${escapeHtml(preview)}</div>
@@ -227,14 +237,37 @@ async function openChat(chat) {
   $("#loadMoreWrap").hidden = true;
   await reloadHistory();
   await refreshReplyTarget();
+  if (chat.startsWith("friend_")) warmProfile(chat.slice(7));
+}
+
+// 拉取单个用户官方资料（用户名/头像/主动消息权限），完成后刷新列表与头部
+async function warmProfile(openid) {
+  if (!openid || profiles[openid]) { renderChatHead(chats.find((c) => c.chat === current)); return; }
+  try {
+    const d = await api(`/user_info?openid=${encodeURIComponent(openid)}`);
+    if (d && d.ok) {
+      profiles[openid] = d;
+      renderChatList();
+      renderChatHead(chats.find((c) => c.chat === current));
+    } else {
+      profiles[openid] = { username: "", avatar: "", allow_proactive_msg: null };  // 负缓存防反复请求
+    }
+  } catch { /* 静默：面板资料是增强信息，失败不影响主功能 */ }
 }
 
 function renderChatHead(chatInfo) {
-  if (!current) { $("#chatTitle").textContent = "选择一个会话"; $("#chatSub").textContent = ""; $("#renameBtn").hidden = true; return; }
+  const headAv = $("#headAvatar");
+  if (!current) { $("#chatTitle").textContent = "选择一个会话"; $("#chatSub").textContent = ""; $("#renameBtn").hidden = true; headAv.hidden = true; return; }
   const type = chatInfo ? chatInfo.type : current.split("_", 1)[0];
   $("#chatTitle").textContent = displayName(current, type, chatInfo && chatInfo.name);
   const typeText = { group: "QQ 群聊", friend: "好友私聊", dms: "群私信", guild: "频道" }[type] || type;
-  $("#chatSub").textContent = `${typeText} · ${current}`;
+  const p = type === "friend" ? profiles[current.slice(7)] : null;
+  let sub = `${typeText} · ${current}`;
+  if (p && p.username) sub = `${typeText} · ${p.username}`;
+  if (p && p.allow_proactive_msg === false) sub += " · ⚠️ 主动消息受限（被动回复窗口外发不出）";
+  $("#chatSub").textContent = sub;
+  if (p && p.avatar) { headAv.src = avatarSrc(p.avatar); headAv.hidden = false; }
+  else headAv.hidden = true;
   $("#renameBtn").hidden = false;
 }
 
@@ -308,8 +341,10 @@ function renderMsg(m) {
   const meta = `${escapeHtml(who)} · ${fmtTime(m.ts)}` +
     (m.msg_id ? `<span class="msg-id">#${escapeHtml(shortId(m.msg_id))}</span>` : "");
   const replyFlag = out && m.reply_to ? `<div class="reply-flag">↩ 被动回复</div>` : "";
+  const p = !out && m.user ? profiles[m.user] : null;
+  const inAv = p && p.avatar ? `<img class="avatar-img" src="${escapeHtml(avatarSrc(p.avatar))}" alt="" onerror="this.remove()">` : escapeHtml(who.slice(0, 1));
   div.innerHTML = `
-    <div class="msg-avatar" style="background:${avatarColor(out ? "bot" : m.user)}">${out ? "机" : escapeHtml(who.slice(0, 1))}</div>
+    <div class="msg-avatar" style="background:${avatarColor(out ? "bot" : m.user)}">${out ? "机" : inAv}</div>
     <div class="msg-body">
       <div class="msg-meta">${meta}</div>
       <div class="bubble">${replyFlag}${renderText(m.text || "")}</div>
@@ -742,6 +777,10 @@ async function enterPanel() {
   try {
     await fetchChats();
     connectWS();
+    // 预热好友官方资料（服务端 6h 缓存 + 在飞去重；首轮冷缓存由后台温场）
+    for (const c of chats.filter((c) => c.type === "friend").slice(0, 30)) {
+      if (!profiles[c.chat.slice(7)]) warmProfile(c.chat.slice(7));
+    }
     const desktop = !window.matchMedia("(max-width: 720px)").matches;
     if (chats.length && desktop) openChat(chats[0].chat);
   } catch (err) {

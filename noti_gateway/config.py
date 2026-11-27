@@ -190,6 +190,10 @@ class AgentsCfg:
     quiet_levels: list[str] = field(default_factory=lambda: ["info"])
     # per-source 呈现模板（{{ title }} / {{ body }} 等）；未配置的 source 原样通过
     templates: dict[str, str] = field(default_factory=dict)
+    # MD 卡片：为来源通知自动组装 QQ markdown 卡片（msg_type=2），发送侧无权限时自动降级纯文本
+    md_card: bool = False
+    # 卡片适用来源；留空 = 同 sources
+    md_card_sources: list[str] = field(default_factory=list)
 
 
 @dataclass

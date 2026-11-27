@@ -71,8 +71,8 @@ function todayFile() {
   return path.join(LOG_DIR, 'zcode-' + d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '.jsonl');
 }
 
-// 不可自动重试的失败：续一次也是白点（鉴权/配额/余额/上下文超限），放弃并退出
-const FATAL_RE = /unauthor|forbidden|api[_-]?key|quota|balance|billing|insufficient|context.*(length|overflow|exceed)/i;
+// 注：注入时代的 FATAL_RE（quota 等放弃重试）已随注入一起移除——
+// 通知模式下繁忙/配额耗尽恰是用户要收通知的场景，所有非取消失败统一通知（上限 2 次）。
 
 function handleRecord(rec) {
   if (!rec) return;
@@ -84,7 +84,6 @@ function handleRecord(rec) {
   if (!rec.event && rec.message === 'v4 background turn failed' && sid === SESSION && !busy) {
     const errStr = String((rec.context && rec.context.error) || '');
     if (CANCEL_RE.test(errStr)) { log('轮次为手动取消（v4 background: ' + errStr.slice(0, 60) + '），监视器退出'); process.exit(0); }
-    if (FATAL_RE.test(errStr)) { log('不可重试的失败（' + errStr.slice(0, 60) + '），放弃自动继续，监视器退出'); process.exit(0); }
     onFailure('V4_BACKGROUND', errStr);
     return;
   }
@@ -111,37 +110,29 @@ function handleRecord(rec) {
     if (rec.status === 'cancelled' || CANCEL_RE.test(code) || CANCEL_RE.test(cause.code || '') || CANCEL_RE.test(msg)) {
       log('轮次为手动取消（' + code + '），监视器退出'); process.exit(0);
     }
-    if (FATAL_RE.test(code) || FATAL_RE.test(msg)) {
-      log('不可重试的失败（' + code + ' ' + String(msg).slice(0, 60) + '），放弃自动继续，监视器退出');
-      process.exit(0);
-    }
     onFailure(code, msg);
   }
 }
 
 function onFailure(code, message) {
-  if (retryCount >= DELAYS.length) { log('第 3 次失败，放弃自动继续，监视器退出'); process.exit(0); }
-  const delay = DELAYS[retryCount];
+  // 注入式自动继续（continue-input.ps1）实测不可靠：粘贴落错会话、回车不保证发送——
+  // 改为 QQ 通知（qq-notify.sh notify 模式，网关 HMAC 投递/直连兜底），最多 2 次
+  if (retryCount >= 2) { log('第 3 次失败，不再通知，监视器退出'); process.exit(0); }
   retryCount += 1;
   saveRetry();
-  busy = true;
   log('轮次失败 code=' + code + ' msg=' + String(message).slice(0, 80) +
-      ' → 第 ' + retryCount + ' 次，等 ' + delay / 1000 + 's 后注入“继续”');
-  setTimeout(() => {
-    if (lastActivitySession !== SESSION) {
-      log('等待期间用户已切到其他会话，放弃注入（防打错窗口），退出');
-      process.exit(0);
-    }
-    if (DRY_RUN) { log('DRY_RUN：此处应调用 continue-input.ps1 注入“继续”'); busy = false; return; }
-    const child = spawn('powershell.exe',
-      ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', path.join(HOOKS, 'continue-input.ps1')],
-      { stdio: 'ignore', windowsHide: true });
-    child.on('exit', c => {
-      log('continue-input.ps1 退出码 ' + c + (c === 0 ? '（已注入“继续”）' : '（未注入，停止本次任务）'));
-      busy = false;
-      if (c !== 0) process.exit(0);
-    });
-  }, delay);
+      ' → QQ 中断通知（第 ' + retryCount + ' 次）');
+  if (DRY_RUN) { log('DRY_RUN：此处应调用 qq-notify.sh notify 投递中断通知'); return; }
+  const tf = path.join(os.tmpdir(), 'zcode-turnfail-' + process.pid + '-' + Date.now() + '.txt');
+  const errText = String(message || '').slice(0, 300) || ('错误码: ' + code);
+  try { fs.writeFileSync(tf, errText); } catch (e) {}
+  const bash = process.env.ZCODE_BASH || 'D:/net/Git/bin/bash.exe';
+  try {
+    const child = spawn(bash,
+      [path.join(os.homedir(), '.zcode', 'qq-notify.sh'), 'notify', tf, SESSION],
+      { stdio: 'ignore', windowsHide: true, detached: true });
+    child.unref();
+  } catch (e) { log('通知投递异常: ' + e.message); }
 }
 
 setInterval(() => {

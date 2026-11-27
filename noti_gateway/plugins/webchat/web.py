@@ -18,7 +18,7 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
@@ -44,6 +44,8 @@ StatusFunc = Callable[[], dict[str, bool]]
 # 图片转存：url -> 本地缓存路径（下载失败/黑名单返回 None）
 MediaFetchFunc = Callable[[str], Awaitable[Any]]
 UrlAllowedFunc = Callable[[str], bool]
+# 用户基本信息：openid -> {username, avatar, allow_proactive_msg}；fetch=False 仅查缓存
+UserInfoFunc = Callable[[str, bool], Awaitable[Any]]
 
 class PanelCtx:
     """单个面板实例的状态：注入实现 + 登录限速计数（实例作用域，非模块全局）。"""
@@ -58,6 +60,7 @@ class PanelCtx:
         status: StatusFunc,
         media_fetch: MediaFetchFunc,
         url_allowed: UrlAllowedFunc,
+        user_info: UserInfoFunc | None = None,
     ) -> None:
         self.store = store
         self.secret = secret
@@ -67,6 +70,7 @@ class PanelCtx:
         self.status = status
         self.media_fetch = media_fetch
         self.url_allowed = url_allowed
+        self.user_info = user_info
         # 登录限速：失败计数，连续失败后锁定一段时间
         self.login_fails = 0
         self.login_locked_until = 0.0
@@ -130,6 +134,7 @@ def setup(
     status: StatusFunc,
     media_fetch: MediaFetchFunc,
     url_allowed: UrlAllowedFunc,
+    user_info: UserInfoFunc | None = None,
 ) -> None:
     """注册路由与静态资源；在插件加载期调用一次。
 
@@ -137,7 +142,7 @@ def setup(
     挂多个面板实例（测试/多 bot），互不串扰。
     """
     st = PanelCtx(store, secret, session_days, send, send_media, status,
-                  media_fetch, url_allowed)
+                  media_fetch, url_allowed, user_info)
 
     def check_session(request: Request) -> None:
         supplied = (
@@ -176,7 +181,43 @@ def setup(
 
     @app.get("/webchat/api/chats", dependencies=[AUTH])
     async def api_chats() -> dict[str, Any]:
-        return {"chats": st.store.summary()}
+        chats = st.store.summary()
+        if st.user_info is not None:
+            cold: list[str] = []
+            for c in chats:
+                if c.get("type") != "friend":
+                    continue
+                openid = str(c["chat"])[len("friend_"):]
+                info = await st.user_info(openid, fetch=False)  # 仅查缓存，不阻塞列表
+                if info:
+                    c["username"] = info.get("username") or ""
+                    u = info.get("avatar") or ""
+                    if u and st.url_allowed(u):
+                        c["avatar"] = f"/webchat/api/media?u={quote(u, safe='')}"
+                elif len(cold) < 20:
+                    cold.append(openid)  # 冷缓存：后台温场，下一轮刷新可见
+            for openid in cold:
+                asyncio.create_task(st.user_info(openid, fetch=True))
+        return {"chats": chats}
+
+    @app.get("/webchat/api/user_info", dependencies=[AUTH])
+    async def api_user_info(openid: str) -> dict[str, Any]:
+        """用户基本信息（官方 /v2/users/{openid}/info，TTL 缓存）。
+
+        avatar 经面板代理改写为相对地址（token 由前端统一附加）。
+        """
+        if st.user_info is None:
+            raise HTTPException(status_code=503, detail="user_info 未启用")
+        info = await st.user_info(openid, fetch=True)
+        if not info:
+            return {"ok": False, "error": "不可用（接口无权限或对方未与 bot 互动过）"}
+        out = {"ok": True, "openid": openid,
+               "username": info.get("username") or "",
+               "allow_proactive_msg": bool(info.get("allow_proactive_msg"))}
+        u = info.get("avatar") or ""
+        if u and st.url_allowed(u):
+            out["avatar"] = f"/webchat/api/media?u={quote(u, safe='')}"
+        return out
 
     @app.get("/webchat/api/messages", dependencies=[AUTH])
     async def api_messages(

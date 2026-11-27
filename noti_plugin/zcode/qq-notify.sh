@@ -17,7 +17,7 @@ PING_URL="http://127.0.0.1:39527"  # 常驻监听（qq-bot-listener.py，可选�
 WAIT_SECONDS=90                     # 最多等按钮点击的秒数，超时回退到 ZCode 本地确认框
 GATEWAY_URL="${GATEWAY_URL:-http://<网关地址>}"        # 阿里云 noti-gateway
 GATEWAY_KEY_ID="${GATEWAY_KEY_ID:-zcode}"                       # 网关 keys.conf 里的密钥代号
-GATEWAY_SECRET="${GATEWAY_SECRET:-<网关 keys.conf 里 zcode 行的 HMAC secret>}"  # keys.conf zcode 行（HMAC v1，唯一鉴权方式）
+GATEWAY_SECRET="${GATEWAY_SECRET:-<网关 keys.conf 里对应 hmac 行的 secret>}"  # keys.conf zcode 行（HMAC v1，唯一鉴权方式）
 # =========================================================
 
 # 直连 QQ 的 TOKEN_URL/SEND_URL 已下线（2026-11-22）：所有发送统一走网关 raw_qq/通知接口
@@ -97,14 +97,16 @@ dir_e=$(json_escape "$dir")
 
 # ---------- 3a. 提问模式：发卡片并等待按钮点击 ----------
 if [[ "${1:-}" == "ask" ]]; then
-  # 从 hook stdin 的 JSON 里提取工具名和命令摘要
-  if [[ -t 0 ]]; then input=""; else input=$(head -c 4096 2>/dev/null); fi
+  # 从 hook stdin 的 JSON 里提取工具名和命令摘要（大窗口：AUQ 载荷含长题目描述轻松超 4KB）
+  if [[ -t 0 ]]; then input=""; else input=$(head -c 65536 2>/dev/null); fi
   tool=$(printf '%s' "$input" | sed -n 's/.*"tool_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
   cmd=$(printf '%s' "$input" | sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
 
   # 选择题有自己的钩子（PreToolUse/choice 分支）。AskUserQuestion 会同时触发
-  # PermissionRequest，若此处再拦会双重扣住同一工具调用（实测先 600s 再 49s），直接放行
-  if [[ "$tool" == "AskUserQuestion" ]]; then
+  # PermissionRequest，若此处再拦会双重扣住同一工具调用，直接放行。
+  # 判定用原始输入子串匹配：真实载荷里提取值可能带尾部坏字节（实测卡片显示
+  # AskUserQuestion 却 == 比较失败），对载荷形状子串匹配是免疫的
+  if [[ "$input" == *AskUserQuestion* || "$tool" == *AskUserQuestion* ]]; then
     log "ask: 工具为 AskUserQuestion，交由 choice 钩子处理，本钩子放行"
     exit 0
   fi
@@ -216,9 +218,10 @@ if [[ "${1:-}" == "choice" ]]; then
     listener_pid=$!
 
     waited=0
+    listener_died=0
     while (( waited < hold_s + 15 )); do
       [[ -f "$answer_file" ]] && break
-      kill -0 "$listener_pid" 2>/dev/null || break  # 监听器异常退出（卡片未发出等）
+      kill -0 "$listener_pid" 2>/dev/null || { listener_died=1; break; }  # 监听器异常退出（卡片未发出/致命错误等）
       sleep 2
       waited=$((waited + 2))
     done
@@ -234,7 +237,11 @@ if [[ "${1:-}" == "choice" ]]; then
         exit 2  # deny：AskUserQuestion 不落地，reason 携带答案回给同一轮的模型
       fi
     fi
-    log "choice: 超时无人应答，放行走本地 UI"
+    if (( listener_died )); then
+      log "choice: 监听器异常退出（非超时），放行走本地 UI"
+    else
+      log "choice: 超时无人应答，放行走本地 UI"
+    fi
     exit 0
   fi
 
@@ -290,6 +297,67 @@ if [[ "${1:-}" == "test" ]]; then
   else
     printf '%s 秒内未收到任何回答\n' "${QQ_TEST_WAIT:-90}"
   fi
+  exit 0
+fi
+
+# ---------- 3a4. notify 模式：外部监视器（watch-turn 等）投递任务中断通知 ----------
+# 用法: qq-notify.sh notify <正文文本文件(UTF-8)> [session_id]
+# 正文文件放错误摘要（watch-turn.js 写入，避免 Windows 命令行中文乱码）；
+# 标题按 session_id 查任务索引；投递复用网关 HMAC 通道，失败直连 QQ 兜底
+if [[ "${1:-}" == "notify" ]]; then
+  body_file="${2:-}"
+  sid_n="${3:-}"
+  [[ -z "$sid_n" ]] && sid_n="${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}"
+  title=""
+  if [[ -n "$sid_n" ]]; then
+    title=$(python - "$sid_n" <<'PYEOF'
+import os, sqlite3, sys
+try:
+    db = sqlite3.connect(
+        'file:' + os.path.expanduser('~') + '/.zcode/v2/tasks-index.sqlite?mode=ro',
+        uri=True, timeout=2)
+    row = db.execute(
+        "SELECT title FROM tasks WHERE task_id=? AND deleted=0",
+        (sys.argv[1],)).fetchone()
+    print((row[0] or '').strip() if row else '')
+except Exception:
+    print('')
+PYEOF
+)
+  fi
+  body=""
+  [[ -n "$body_file" && -f "$body_file" ]] && body=$(cat "$body_file" 2>/dev/null)
+  msg="⚠️ ZCode 任务中断（轮次失败）$(date '+%H:%M:%S')"
+  [[ -n "$title" ]] && msg="$msg"$'\n'"📌 ${title:0:60}"
+  [[ -n "$body" ]] && msg="$msg"$'\n'"${body:0:400}"
+  msg="$msg"$'\n'"（回到该会话发送「继续」可重试）"
+  msg="${msg:0:900}"
+  log "notify: 中断通知 -> ${title:0:40}"
+
+  if [[ -n "$GATEWAY_URL" && -n "$GATEWAY_SECRET" ]]; then
+    gw_payload="$HOME/.zcode/.qq-gateway-payload"
+    printf '%s' "$msg" > "$gw_payload"
+    gw_ts=$(date +%s)
+    gw_nonce="${gw_ts}-$$-${RANDOM}${RANDOM}"
+    gw_sha=$(sha256sum "$gw_payload" | awk '{print $1}')
+    gw_sig=$(printf 'POST\n/n/zcode\n%s\n%s\n%s' "$gw_ts" "$gw_nonce" "$gw_sha" \
+      | openssl dgst -sha256 -hmac "$GATEWAY_SECRET" | awk '{print $NF}')
+    gw_code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST "${GATEWAY_URL}/n/zcode" \
+      -H "X-Noti-Signature: v1=${gw_sig}" \
+      -H "X-Noti-Timestamp: ${gw_ts}" \
+      -H "X-Noti-Nonce: ${gw_nonce}" \
+      -H "X-Noti-Content-SHA256: ${gw_sha}" \
+      -H "X-Noti-Key-Id: ${GATEWAY_KEY_ID}" \
+      -H "Content-Type: text/plain" \
+      --data-binary @"$gw_payload")
+    if [[ "$gw_code" == 20* ]]; then
+      exit 0   # 202=已入队落盘，网关负责投递；200=同步成功
+    fi
+    log "notify: 网关投递失败 HTTP $gw_code，直连兜底"
+  fi
+  msg_e=$(json_escape "$msg")
+  printf '{"msg_type":0,"content":"%s","msg_seq":%s}' "$msg_e" "$seq" > "$PAYLOAD_FILE"
+  send_payload
   exit 0
 fi
 

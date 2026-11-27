@@ -183,6 +183,15 @@ class QQAuthError(Exception):
         self.message = message
 
 
+# markdown/键盘权限缺失特征：QQ 开放平台对未申请权限的 bot 返回 400 +
+# message 带 markdown/keyboard/模板 等字样（契约同 opencode/dsh 客户端的降级判据）。
+_MD_PERM_RE = re.compile(r"markdown|keyboard|模板|权限|not.?allow|permission", re.I)
+
+
+def _looks_like_md_perm(status: int, text: str) -> bool:
+    return status == 400 and bool(_MD_PERM_RE.search(text or ""))
+
+
 class QQBotTarget:
     """群聊/单聊/频道三种场景。
 
@@ -242,43 +251,77 @@ class QQBotTarget:
         return None
 
     async def _send_special(self, n: Notification) -> SendResult:
+        """markdown/keyboard/ark/raw_qq 专用载荷发送。
+
+        平台未开放 markdown 权限（400 + 特征报错）时自动降级为纯文本重发一次；
+        成功/失败都出站观察者（webchat 面板展示卡片文本）。
+        """
         t0 = time.monotonic()
         if self.scene == "channel":
             return fail(self.id, 0, "频道场景不支持 markdown/keyboard/ark/raw_qq（仅文本与富媒体）", retryable=False)
         payload = self._special_payload(n) or {}
+        md = payload.get("markdown")
+        out = {
+            "kind": "ark" if payload.get("ark") else ("raw_qq" if payload.get("raw_qq") else "markdown"),
+            "text": ((md.get("content") if isinstance(md, dict) else "") or "[卡片消息]"),
+            "msg_id": "",
+        }
+
+        def done(r: SendResult) -> SendResult:
+            r.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            if self.scene in ("c2c", "group"):
+                _fire_send_observers({
+                    "scene": self.scene,
+                    "scene_id": self.scene_id,
+                    "kind": out["kind"],
+                    "text": out["text"][:2000],
+                    "msg_id": out["msg_id"] if r.ok else "",
+                    "error": "" if r.ok else r.detail[:300],
+                })
+            return r
+
         for attempt in (1, 2):  # 第二次用于 401 后强制刷新 token 重试
             try:
                 token = await self.tokens.get(force=attempt == 2)
             except QQAuthError as e:
-                return fail(self.id, e.code, f"token error: {e.message}", retryable=False)
+                return done(fail(self.id, e.code, f"token error: {e.message}", retryable=False))
             except Exception as e:
-                return fail(self.id, 0, f"token request failed: {e!r}", retryable=True)
+                return done(fail(self.id, 0, f"token request failed: {e!r}", retryable=True))
             try:
                 r = await self.tokens.client.post(
                     self._path(), headers={"Authorization": f"QQBot {token}"},
                     json=payload, timeout=self.cfg.timeout,
                 )
             except Exception as e:
-                return fail(self.id, 0, f"special send failed: {e!r}", retryable=True)
+                return done(fail(self.id, 0, f"special send failed: {e!r}", retryable=True))
             if r.status_code == 401 and attempt == 1:
                 self.tokens.invalidate()
                 continue
             if r.status_code == 429 or r.status_code >= 500:
-                return fail(self.id, r.status_code, f"special http {r.status_code}: {r.text[:200]}", retryable=True)
+                return done(fail(self.id, r.status_code, f"special http {r.status_code}: {r.text[:200]}", retryable=True))
             if r.status_code >= 400:
-                return fail(self.id, r.status_code, f"special http {r.status_code}: {r.text[:200]}", retryable=False)
+                detail = f"special http {r.status_code}: {r.text[:200]}"
+                # 无 markdown/键盘权限：仅 markdown 路径降级纯文本（ark/raw_qq 无正文可降）
+                if out["kind"] == "markdown" and _looks_like_md_perm(r.status_code, r.text):
+                    return await self._send_text(n)
+                return done(fail(self.id, r.status_code, detail, retryable=False))
             try:
                 body = r.json()
             except Exception:
-                return ok(self.id, "non-json response", int((time.monotonic() - t0) * 1000))
+                return done(ok(self.id, "non-json response", int((time.monotonic() - t0) * 1000)))
             code = int(body.get("code") or 0) if isinstance(body, dict) else 0
             if code == 0:
-                return ok(self.id, f"msg_type={payload.get('msg_type')} msg_id={body.get('id', '')}",
-                          int((time.monotonic() - t0) * 1000))
-            return fail(self.id, code, body.get("message") or json.dumps(body, ensure_ascii=False)[:200],
-                        retryable=code in QQ_RETRYABLE_CODES,
-                        elapsed_ms=int((time.monotonic() - t0) * 1000))
-        return fail(self.id, 0, "unreachable")
+                out["msg_id"] = str(body.get("id", ""))
+                return done(ok(self.id, f"msg_type={payload.get('msg_type')} msg_id={out['msg_id']}",
+                               int((time.monotonic() - t0) * 1000)))
+            msg = body.get("message") or json.dumps(body, ensure_ascii=False)[:200]
+            # 失败也常是 HTTP 200 + body.code；仅 markdown 路径降级纯文本
+            if out["kind"] == "markdown" and _looks_like_md_perm(400, msg):
+                return await self._send_text(n)
+            return done(fail(self.id, code, msg,
+                             retryable=code in QQ_RETRYABLE_CODES,
+                             elapsed_ms=int((time.monotonic() - t0) * 1000)))
+        return done(fail(self.id, 0, "unreachable"))
 
     # ---------------- 富媒体（图片 / 文件 / 视频 / 音频） ----------------
     # 双通道上传：≤5MB 先走 /files 直传（api.sgroup.qq.com + file_data base64，
@@ -594,7 +637,9 @@ class QQBotTarget:
 
             try:
                 payload = self._payload(n)
-                out["text"] = str(payload.get("content") or payload.get("markdown") or "")
+                _md = payload.get("markdown")
+                out["text"] = str(payload.get("content")
+                                  or (_md.get("content") if isinstance(_md, dict) else _md) or "")
                 # 被动回复：meta.passive 带 msg_id 时附加 msg_id/msg_seq，不占主动配额
                 params = _passive_params((n.meta or {}).get("passive"))
                 if params:

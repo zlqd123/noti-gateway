@@ -309,108 +309,123 @@ def load_questions(plan_path: str) -> list:
 
 
 def main(rid: str, wait_seconds: float, selftest: bool, plan: str = None) -> int:
+    """挂起等待（SSE 版）：断线自动重连直到总期限——空闲超时/代理断流不再中断挂起。
+    终局动作（写应答/发反馈）只发生一次；卡片只发一次，重连后继续收事件。"""
     deadline = time.time() + wait_seconds
-    log(f"rid={rid} 连接网关 SSE stream（{GATEWAY_URL}）")
+    questions, collector = [], None
+    cards_ready = False   # 卡片已发 / 就绪文件已写
+    attempts = 0
+    log(f"rid={rid} 连接网关 SSE stream（{GATEWAY_URL}），总期限 {int(wait_seconds)}s")
 
-    try:
-        cm = httpx.stream("GET", GATEWAY_URL + "/stream?types=qq_event",
-                          headers=sig_headers("GET", "/stream"), trust_env=False,
-                          timeout=httpx.Timeout(10, read=25))
-    except Exception as e:
-        log(f"rid={rid} SSE 连接异常: {e!r}")
+    def finalize_timeout() -> int:
+        if collector is not None and (collector.answers or collector.free_text is not None):
+            final = collector.render() + "（部分回答，超时）"
+            _write_answer(rid, final)
+            send_card({"msg_type": 0, "content": f"⚠️ 超时，已按部分回答提交给 ZCode：{final[:80]}",
+                       "msg_seq": random.randint(1, 10**6)})
+            log(f"rid={rid} 超时，按已收集的部分回答终结")
+            return 0
+        log(f"rid={rid} 等待点击超时")
         return 1
 
-    with cm as r:
-        if r.status_code != 200:
-            log(f"rid={rid} SSE HTTP {r.status_code}")
-            return 1
-        it = r.iter_lines()
-        # 连接就绪（SSE 首条注释行）→ 写就绪文件 / 发选择题卡片
-        connected = False
-        for line in it:
-            if line.startswith(": connected"):
-                connected = True
-                break
-            if time.time() > deadline:
-                break
-        if not connected:
-            log(f"rid={rid} 等待 SSE 就绪超时")
-            return 1
-        log(f"rid={rid} SSE 就绪")
-        if selftest:
+    while True:  # 重连循环
+        attempts += 1
+        if time.time() >= deadline:
+            return finalize_timeout()
+        try:
+            cm = httpx.stream("GET", GATEWAY_URL + "/stream?types=qq_event",
+                              headers=sig_headers("GET", "/stream"), trust_env=False,
+                              timeout=httpx.Timeout(10, read=25))
+        except Exception as e:
+            log(f"rid={rid} SSE 连接异常(第{attempts}次): {e!r}，2s 后重试")
             time.sleep(2)
-            return 0
-        questions, collector = [], None
-        if plan:
-            questions = load_questions(plan)
-            if not questions or not build_question_cards(rid, questions):
-                log(f"rid={rid} 选择题卡片未发出，放弃代答")
-                return 1
-            collector = ChoiceCollector(questions)
-        else:
-            with open(os.path.join(ZDIR, f".qq-ws-ready-{rid}"), "w", encoding="utf-8") as f:
-                f.write(str(int(time.time() * 1000)))
+            continue
 
-        # 主循环：等按钮点击或文本回复（事件经网关 SSE 转发）
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                if collector is not None and (collector.answers or collector.free_text is not None):
-                    final = collector.render() + "（部分回答，超时）"
-                    _write_answer(rid, final)
-                    send_card({"msg_type": 0, "content": f"⚠️ 超时，已按部分回答提交给 ZCode：{final[:80]}",
-                               "msg_seq": random.randint(1, 10**6)})
-                    log(f"rid={rid} 超时，按已收集的部分回答终结")
-                    return 0
-                log(f"rid={rid} 等待点击超时")
-                return 1
-            try:
-                line = next(it)
-            except StopIteration:
-                log(f"rid={rid} SSE 流结束")
-                return 1
-            except Exception as e:
-                log(f"rid={rid} SSE 异常: {e!r}")
-                return 1
-            if not line.startswith("data: "):
+        with cm as r:
+            if r.status_code != 200:
+                log(f"rid={rid} SSE HTTP {r.status_code}(第{attempts}次)，2s 后重试")
+                time.sleep(2)
                 continue
-            try:
-                m = json.loads(line[6:])
-            except Exception:
+            it = r.iter_lines()
+            # 连接就绪（SSE 首条注释行）
+            connected = False
+            for line in it:
+                if line.startswith(": connected"):
+                    connected = True
+                    break
+                if time.time() > deadline:
+                    break
+            if not connected:
+                if time.time() >= deadline:
+                    return finalize_timeout()
+                log(f"rid={rid} 等待 SSE 就绪超时(第{attempts}次)，重连")
                 continue
-            ev, d = m.get("event"), m.get("data") or {}
-            if ev == "INTERACTION_CREATE":
-                log(f"rid={rid} 交互事件: {json.dumps(d, ensure_ascii=False)[:200]}")
-                if plan:
+            log(f"rid={rid} SSE 就绪(第{attempts}次连接)")
+            if selftest:
+                time.sleep(2)
+                return 0
+            if plan and not cards_ready:
+                questions = load_questions(plan)
+                if not questions or not build_question_cards(rid, questions):
+                    log(f"rid={rid} 选择题卡片未发出，放弃代答")
+                    return 1
+                collector = ChoiceCollector(questions)
+                cards_ready = True
+            elif not plan and not cards_ready:
+                with open(os.path.join(ZDIR, f".qq-ws-ready-{rid}"), "w", encoding="utf-8") as f:
+                    f.write(str(int(time.time() * 1000)))
+                cards_ready = True
+
+            # 读取循环：本连接内消费事件；流断开则回到重连循环
+            while True:
+                if time.time() >= deadline:
+                    return finalize_timeout()
+                try:
+                    line = next(it)
+                except StopIteration:
+                    log(f"rid={rid} SSE 流结束，重连")
+                    break
+                except Exception as e:
+                    log(f"rid={rid} SSE 异常: {e!r}，重连")
+                    break
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    m = json.loads(line[6:])
+                except Exception:
+                    continue
+                ev, d = m.get("event"), m.get("data") or {}
+                if ev == "INTERACTION_CREATE":
+                    log(f"rid={rid} 交互事件: {json.dumps(d, ensure_ascii=False)[:200]}")
                     res = parse_interaction(rid, d)
-                    if isinstance(res, tuple):
-                        collector.add_button(res[0], res[1])
-                        log(f"rid={rid} 已收 {len(collector.answers)}/{len(questions)} 题按钮答案")
-                        if collector.done():
-                            final = collector.render()
-                            _write_answer(rid, final)
-                            send_card({"msg_type": 0, "content": f"✅ 已收到你的回答，已提交给 ZCode：{final[:80]}",
-                                       "msg_seq": random.randint(1, 10**6)})
-                            return 0
-                else:
-                    res = parse_interaction(rid, d)
-                    if res in ("allow", "deny"):
+                    if plan:
+                        if isinstance(res, tuple):
+                            collector.add_button(res[0], res[1])
+                            log(f"rid={rid} 已收 {len(collector.answers)}/{len(questions)} 题按钮答案")
+                            if collector.done():
+                                final = collector.render()
+                                _write_answer(rid, final)
+                                send_card({"msg_type": 0, "content": f"✅ 已收到你的回答，已提交给 ZCode：{final[:80]}",
+                                           "msg_seq": random.randint(1, 10**6)})
+                                return 0
+                    elif res in ("allow", "deny"):
                         _write_answer(rid, res)
                         return 0
-            elif ev == "C2C_MESSAGE_CREATE":
-                if plan:
-                    content = str(d.get("content") or "").strip()
-                    if content:
-                        collector.add_text(content)
-                        if collector.done():
-                            final = collector.render()
-                            _write_answer(rid, final)
-                            send_card({"msg_type": 0, "content": f"✅ 已收到你的回答，已提交给 ZCode：{final[:80]}",
-                                       "msg_seq": random.randint(1, 10**6)})
-                            return 0
-                        log(f"rid={rid} 文本已记 {len(collector.answers)}/{len(questions)} 题，继续等待剩余题目")
-                else:
-                    handle_message(rid, d)
+                elif ev == "C2C_MESSAGE_CREATE":
+                    if plan:
+                        content = str(d.get("content") or "").strip()
+                        if content:
+                            collector.add_text(content)
+                            if collector.done():
+                                final = collector.render()
+                                _write_answer(rid, final)
+                                send_card({"msg_type": 0, "content": f"✅ 已收到你的回答，已提交给 ZCode：{final[:80]}",
+                                           "msg_seq": random.randint(1, 10**6)})
+                                return 0
+                            log(f"rid={rid} 文本已记 {len(collector.answers)}/{len(questions)} 题，继续等待剩余题目")
+                    else:
+                        handle_message(rid, d)
+        # with 块结束 = 本连接断开，回到重连循环（deadline 兜底在循环顶部）
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@
 - 发送：动态构造 QQBotTarget，复用 targets 的文本发送/分片上传/被动回复实现
   （msg_id+msg_seq，窗口外自动降级主动消息）；网页编辑文本/图片/文件发出
 - 图片：消息内 QQ CDN 图经面板代理展示，不受 rkey 时效与 Referer 防盗链影响
+- 资料：官方 /v2/users/{openid}/info 拉取用户名/头像/主动消息权限（TTL 缓存），
+  头像经代理展示、用户名回填会话显示名、权限在面板标注（诊断发送失败）
 
 与 bison2 版（NoneBot monkey-patch 捕获）的差异：
 - 仅单聊（qqws 当前只订阅 C2C）；qqws 扩展群聊事件后在此追加渲染即可
@@ -21,6 +23,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import re
@@ -49,6 +52,9 @@ META = PluginMeta(name="WebChat",
 MEDIA_HOST_SUFFIXES = (".qq.com", ".qq.com.cn", ".qpic.cn", ".gtimg.cn")
 MEDIA_DOWNLOAD_TIMEOUT = 20.0
 MEDIA_MAX_BYTES = 30 * 1024 * 1024
+# 用户基本信息缓存：成功 6 小时 / 失败 10 分钟负缓存（防面板反复打官方接口）
+USER_INFO_TTL = 6 * 3600
+USER_INFO_FAIL_TTL = 600
 
 _FRIEND_RE = re.compile(r"^friend_(.+)$")
 
@@ -142,6 +148,9 @@ class WebchatPlugin:
         # 发送凭据：与 qqws 相同的 bot 归属（首次发送时惰性解析）
         self._qq: Any = None
         self._tokens: Any = None
+        # 用户基本信息缓存：openid -> (过期时刻, info|None)；在飞任务去重
+        self._user_cache: dict[str, tuple[float, dict | None]] = {}
+        self._user_tasks: dict[str, asyncio.Task] = {}
 
     # ---------------- 凭据 ----------------
 
@@ -163,6 +172,64 @@ class WebchatPlugin:
         tcfg = TargetCfg(id=f"webchat-{openid[:12]}", type="qq", user_openid=openid,
                          template="{{ title }}")  # 模板取原文，面板发的就是发的
         return QQBotTarget(tcfg, qq, tokens, self.ctx.client)
+
+    # ---------------- 用户基本信息 ----------------
+
+    async def user_info(self, openid: str, fetch: bool = True) -> dict | None:
+        """官方 GET /v2/users/{openid}/info（username/avatar/主动消息权限）。
+
+        fetch=False 仅查缓存（会话列表 enrich 用）；fetch=True 命中在飞任务则复用。
+        """
+        hit = self._user_cache.get(openid)
+        if hit and hit[0] > time.time():
+            return hit[1]
+        if not fetch:
+            return hit[1] if hit else None
+        task = self._user_tasks.get(openid)
+        if task is None:
+            task = asyncio.create_task(self._fetch_user_info(openid))
+            self._user_tasks[openid] = task
+        try:
+            return await task
+        finally:
+            pass  # 任务自身在 finally 中摘除
+
+    async def _fetch_user_info(self, openid: str) -> dict | None:
+        try:
+            creds = self._credentials()
+            if creds is None:
+                self._user_cache[openid] = (time.time() + USER_INFO_FAIL_TTL, None)
+                return None
+            qq, tokens = creds
+            token = await tokens.get()
+            r = await self.ctx.client.get(
+                f"{qq.api_base.rstrip('/')}/v2/users/{openid}/info",
+                headers={"Authorization": f"QQBot {token}"},
+            )
+            try:
+                d = r.json()
+            except Exception:  # noqa: BLE001
+                d = None
+            if r.status_code != 200 or not isinstance(d, dict):
+                self._user_cache[openid] = (time.time() + USER_INFO_FAIL_TTL, None)
+                log.info("[WebChat] 用户信息不可用 openid=%s http=%s", openid[:8], r.status_code)
+                return None
+            info = {
+                "username": str(d.get("username") or ""),
+                "avatar": str(d.get("avatar") or ""),
+                "allow_proactive_msg": bool(d.get("allow_proactive_msg")),
+            }
+            self._user_cache[openid] = (time.time() + USER_INFO_TTL, info)
+            if info["username"]:
+                # 官方资料回填会话显示名（本地别名仍由前端 localStorage 覆盖）
+                self.store.set_chat_name(f"friend_{openid}", info["username"])
+            return info
+        except Exception:  # noqa: BLE001
+            self._user_cache[openid] = (time.time() + USER_INFO_FAIL_TTL, None)
+            log.exception("[WebChat] 用户信息拉取失败 openid=%s", openid[:8])
+            return None
+        finally:
+            self._user_tasks.pop(openid, None)
 
     # ---------------- 进站 ----------------
 
@@ -306,8 +373,10 @@ class WebchatPlugin:
             self._bot_status,
             _fetch_media,
             _url_allowed,
+            user_info=self.user_info,
         )
         self.ctx.stats_providers["webchat"] = lambda: {
+            "user_cache": len(self._user_cache),
             "chats": len(self.store.summary()),
             "totp_secret_file": str(self.data_dir / "webchat_totp_secret.txt")
             if not self.cfg.totp_secret else "(config)",
